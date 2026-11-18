@@ -1,15 +1,17 @@
-import os
-
 import psycopg
-from dotenv import load_dotenv
 
-load_dotenv()
 
 def get_connection():
+    # Use the same connection settings as your working game_summary.py.
     return psycopg.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT")
+        dbname="Football-Model1.0",
+        user="postgres",
+        password="J-brown2026",
+        host="localhost",
+        port="5432",
     )
+
+
+
+
+    
