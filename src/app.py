@@ -46,12 +46,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
 )
 
+from roster_management import RosterManagementDialog
 from user_store import authenticate_user, create_user
 from database import get_connection
 from backup_manager import create_backup
 from session_store import save_session, load_session, clear_session
-
-
+from team_management import TeamManagementDialog
+from player_management import PlayerManagementDialog
 
 
 
@@ -600,7 +601,7 @@ class ReportsDialog(QDialog):
             self.load_defensive_report()
             return
 
-        
+
         try:
             with get_connection() as conn:
                 with conn.cursor() as cur:
@@ -1110,8 +1111,8 @@ WHERE game_id = %s
             self.close()
 
 
-    
-    
+
+
     def load_defensive_report(self):
         try:
             with get_connection() as conn:
@@ -1335,7 +1336,7 @@ WHERE game_id = %s
 
 
 
-    
+
 
     def export_csv(self):
         file_path, _ = QFileDialog.getSaveFileName(
@@ -2194,10 +2195,7 @@ class FootballApp(QMainWindow):
 
         self.reports_page = self.build_reports_page()
 
-        self.settings_page = self.build_placeholder_page(
-        "Settings",
-        "Organization, account, and application preferences will appear here."
-    )
+        self.settings_page = self.build_settings_page()
 
         self.pages.addWidget(self.dashboard_page)
         self.pages.addWidget(self.games_page)
@@ -2226,7 +2224,7 @@ class FootballApp(QMainWindow):
         self.show_page(0)
 
     # Load game information
-        
+
         try:
             self.refresh_games()
             self.update_dashboard()
@@ -2867,7 +2865,7 @@ class FootballApp(QMainWindow):
         self.update_game_analytics()
         self.update_down_distance_preview()
 
-    
+
     # ---------------------------------
     # TAB 4: GAME REPORTS
     # ---------------------------------
@@ -2941,7 +2939,7 @@ class FootballApp(QMainWindow):
 
         return page
 
-    
+
     def build_analysis_page(self):
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -3172,7 +3170,7 @@ class FootballApp(QMainWindow):
 
         return page
 
-    
+
     def build_reports_page(self):
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -3280,7 +3278,7 @@ class FootballApp(QMainWindow):
         }
         """)
 
-        
+
         season_layout = QVBoxLayout(season_frame)
         season_layout.setContentsMargins(15, 15, 15, 15)
         season_layout.setSpacing(10)
@@ -3321,7 +3319,7 @@ class FootballApp(QMainWindow):
 
         layout.addWidget(season_frame)
 
-        
+
 
         layout.addStretch()
 
@@ -3334,8 +3332,112 @@ class FootballApp(QMainWindow):
 
 
 
+    def build_settings_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(18)
 
-    
+        title = QLabel("Settings")
+        title.setStyleSheet("font-size: 28px; font-weight: bold;")
+
+        description = QLabel(
+            "Manage your organization, scouting data, "
+            "and application preferences."
+        )
+        description.setStyleSheet("font-size: 14px; color: gray;")
+
+        layout.addWidget(title)
+        layout.addWidget(description)
+
+    # Team Management
+        team_management_title = QLabel("Team Management")
+        team_management_title.setStyleSheet(
+            "font-size: 19px; font-weight: bold; margin-top: 15px;"
+        )
+
+        team_management_description = QLabel(
+            "Create, edit, and manage the teams belonging "
+            "to your organization."
+        )
+        team_management_description.setStyleSheet(
+            "font-size: 14px; color: gray;"
+        )
+
+        team_management_button = QPushButton("Manage Teams")
+        team_management_button.setFixedWidth(180)
+        team_management_button.clicked.connect(
+            self.open_team_management
+        )
+
+        layout.addWidget(team_management_title)
+        layout.addWidget(team_management_description)
+        layout.addWidget(team_management_button)
+            # Roster Management
+        roster_management_title = QLabel("Roster Management")
+        roster_management_title.setStyleSheet(
+            "font-size: 19px; font-weight: bold; margin-top: 15px;"
+        )
+
+        roster_management_description = QLabel(
+            "Create and manage team rosters by season."
+        )
+        roster_management_description.setStyleSheet(
+            "font-size: 14px; color: gray;"
+        )
+
+        roster_management_button = QPushButton("Manage Rosters")
+        roster_management_button.setFixedWidth(180)
+        roster_management_button.clicked.connect(
+            self.open_roster_management
+        )
+
+        layout.addWidget(roster_management_title)
+        layout.addWidget(roster_management_description)
+        layout.addWidget(roster_management_button)
+        self.player_management_button = QPushButton("Manage Players")
+
+        self.player_management_button.clicked.connect(
+        self.open_player_management
+            )
+
+        layout.addWidget(self.player_management_button)
+        layout.addStretch()
+
+        return page
+
+
+
+
+    def open_team_management(self):
+        dialog = TeamManagementDialog(
+            self.organization_id,
+            get_connection,
+            self
+        )
+
+        dialog.exec()
+
+
+    def open_roster_management(self):
+        dialog = RosterManagementDialog(
+            self.organization_id,
+            get_connection,
+            self
+        )
+
+        dialog.exec()
+
+
+    def open_player_management(self):
+        dialog = PlayerManagementDialog(
+            self.organization_id,
+            get_connection,
+            self
+        )
+        dialog.exec()
+
+
     def refresh_games(self):
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -3395,13 +3497,13 @@ class FootballApp(QMainWindow):
             self.new_window = FootballApp(self.login_window.user)
             self.new_window.show()
 
-    
-    
+
+
     def update_game_analytics(self, *_):
         game_id = self.get_selected_game_id()
 
         if not game_id:
-            
+
 
             defaults = {
             "total": "0",
@@ -3482,7 +3584,7 @@ class FootballApp(QMainWindow):
                 label.setText("Error")
 
 
-    
+
     def refresh_central_report_games(self):
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -3527,7 +3629,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def open_central_game_report(self):
         selected_game = self.central_report_game_selector.currentData()
 
@@ -3556,7 +3658,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def update_season_tendencies(self):
         selected_season = self.season_selector.currentData()
 
@@ -3714,7 +3816,7 @@ class FootballApp(QMainWindow):
                     QTableWidgetItem(value)
                 )
 
-    
+
     def update_season_game_comparison(self):
         selected_season = self.season_selector.currentData()
 
@@ -3804,7 +3906,7 @@ class FootballApp(QMainWindow):
                     column,
                     QTableWidgetItem(value)
              )
-          
+
 
 
 
@@ -3855,7 +3957,7 @@ class FootballApp(QMainWindow):
         self.update_season_analysis()
 
 
-    
+
     def refresh_central_report_seasons(self):
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -4218,7 +4320,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def update_down_distance_preview(self, *_):
         game_id = self.get_selected_game_id()
 
@@ -4328,10 +4430,10 @@ class FootballApp(QMainWindow):
 
 
 
-    
 
-            
-   
+
+
+
     def create_game(self):
         dialog = GameSetupDialog(self)
 
@@ -4414,7 +4516,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def get_selected_game_id(self):
         game_id = self.game_selector.currentData()
 
@@ -4504,7 +4606,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def update_play_detail(self):
         selected_rows = self.table.selectionModel().selectedRows()
 
@@ -4551,7 +4653,7 @@ class FootballApp(QMainWindow):
 
 
 
-    
+
     def edit_game_setup(self):
         game_id = self.get_selected_game_id()
 
@@ -4715,8 +4817,8 @@ class FootballApp(QMainWindow):
 
 
 
-    
-       
+
+
     def open_report(self):
         game_id = self.get_selected_game_id()
         game_name = self.game_selector.currentText().strip()
@@ -4737,10 +4839,10 @@ class FootballApp(QMainWindow):
             self.organization_id,
             report_type,
             self
-        )   
+        )
         dialog.exec()
 
-    
+
     def open_situational_analysis(self):
         game_id = self.get_selected_game_id()
         game_name = self.game_selector.currentText().strip()
@@ -5009,7 +5111,7 @@ class FootballApp(QMainWindow):
                                     db_id,
                                     self.organization_id,
                              ),
-                            )   
+                            )
 
                             if cur.rowcount != 1:
                                 raise ValueError(
@@ -5318,7 +5420,7 @@ class FootballApp(QMainWindow):
             self._autosave_suspended = False
 
 
-    
+
     def set_cell_value(self, row, column, value):
         # Dropdowns for common football charting fields.
         options = {
