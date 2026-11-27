@@ -318,6 +318,272 @@ def detect_player_entries(words, selection_bbox):
 
 
 
+def infer_pdf_columns(words, selection_bbox):
+    """
+    Infer likely column boundaries from repeated horizontal
+    whitespace gaps across visually aligned rows.
+
+    This is structural detection only. It does not identify
+    semantic fields such as Name, Position, or Height.
+    """
+
+    sx0, sy0, sx1, sy1 = map(float, selection_bbox)
+
+    valid_words = []
+
+    for word in words:
+        bbox = word.get("bbox")
+
+        if not bbox or len(bbox) != 4:
+            continue
+
+        try:
+            x0, y0, x1, y1 = map(float, bbox)
+        except (TypeError, ValueError):
+            continue
+
+        if x1 <= x0 or y1 <= y0:
+            continue
+
+        valid_words.append({
+            "text": word.get("text", "").strip(),
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+            "center_y": (y0 + y1) / 2,
+            "height": y1 - y0,
+        })
+
+    if len(valid_words) < 2:
+        return {
+            "boundaries": [],
+            "columns": [],
+            "diagnostics": "Not enough words to infer columns.",
+        }
+
+    # --------------------------------------------------
+    # 1. Estimate typical word height.
+    # --------------------------------------------------
+
+    heights = sorted(
+        word["height"] for word in valid_words
+    )
+
+    median_height = heights[len(heights) // 2]
+
+    row_tolerance = max(2.0, median_height * 0.6)
+    minimum_gap = max(6.0, median_height * 1.5)
+    gap_cluster_tolerance = max(5.0, median_height * 1.5)
+
+    # --------------------------------------------------
+    # 2. Group words into visual rows using Y positions.
+    # --------------------------------------------------
+
+    sorted_words = sorted(
+        valid_words,
+        key=lambda word: word["center_y"],
+    )
+
+    visual_rows = []
+
+    for word in sorted_words:
+        matching_row = None
+
+        for row in reversed(visual_rows):
+            row_center = sum(
+                item["center_y"] for item in row
+            ) / len(row)
+
+            if abs(word["center_y"] - row_center) <= row_tolerance:
+                matching_row = row
+                break
+
+            if word["center_y"] - row_center > row_tolerance:
+                break
+
+        if matching_row is None:
+            visual_rows.append([word])
+        else:
+            matching_row.append(word)
+
+    # Sort each visual row from left to right.
+    for row in visual_rows:
+        row.sort(key=lambda word: word["x0"])
+
+    # --------------------------------------------------
+    # 3. Find unusually wide gaps between adjacent words.
+    # --------------------------------------------------
+
+    gap_candidates = []
+
+    for row_index, row in enumerate(visual_rows):
+
+        if len(row) < 2:
+            continue
+
+        for left_word, right_word in zip(row, row[1:]):
+
+            gap_width = right_word["x0"] - left_word["x1"]
+
+            if gap_width < minimum_gap:
+                continue
+
+            gap_candidates.append({
+                "center": (
+                    left_word["x1"] + right_word["x0"]
+                ) / 2,
+                "width": gap_width,
+                "row_index": row_index,
+            })
+
+    if not gap_candidates:
+        return {
+            "boundaries": [],
+            "columns": [],
+            "diagnostics": (
+                f"{len(visual_rows)} visual rows examined. "
+                "No repeated wide gaps were detected."
+            ),
+        }
+
+    # --------------------------------------------------
+    # 4. Cluster gaps that occur at similar X positions.
+    # --------------------------------------------------
+
+    gap_candidates.sort(
+        key=lambda item: item["center"]
+    )
+
+    gap_clusters = []
+
+    for candidate in gap_candidates:
+
+        matching_cluster = None
+
+        for cluster in reversed(gap_clusters):
+
+            cluster_center = sum(
+                item["center"] for item in cluster
+            ) / len(cluster)
+
+            if abs(
+                candidate["center"] - cluster_center
+            ) <= gap_cluster_tolerance:
+                matching_cluster = cluster
+                break
+
+            if (
+                cluster_center
+                < candidate["center"] - gap_cluster_tolerance
+            ):
+                break
+
+        if matching_cluster is None:
+            gap_clusters.append([candidate])
+        else:
+            matching_cluster.append(candidate)
+
+    # A boundary needs repeated evidence from different rows.
+    minimum_support = max(
+        2,
+        int(len(visual_rows) * 0.12 + 0.999),
+    )
+
+    accepted_boundaries = []
+
+    for cluster in gap_clusters:
+
+        supporting_rows = {
+            item["row_index"] for item in cluster
+        }
+
+        if len(supporting_rows) < minimum_support:
+            continue
+
+        centers = sorted(
+            item["center"] for item in cluster
+        )
+
+        boundary = centers[len(centers) // 2]
+
+        accepted_boundaries.append({
+            "x": boundary,
+            "support": len(supporting_rows),
+            "observations": len(cluster),
+            "median_gap": sorted(
+                item["width"] for item in cluster
+            )[len(cluster) // 2],
+        })
+
+    accepted_boundaries.sort(
+        key=lambda item: item["x"]
+    )
+
+    # --------------------------------------------------
+    # 5. Build column bands from inferred boundaries.
+    # --------------------------------------------------
+
+    boundaries = [
+        item["x"] for item in accepted_boundaries
+    ]
+
+    column_edges = [sx0] + boundaries + [sx1]
+
+    columns = []
+
+    for column_index in range(len(column_edges) - 1):
+
+        left = column_edges[column_index]
+        right = column_edges[column_index + 1]
+
+        column_lines = []
+
+        for row in visual_rows:
+
+            column_words = [
+                word for word in row
+                if left <= (word["x0"] + word["x1"]) / 2 < right
+            ]
+
+            if not column_words:
+                continue
+
+            column_text = " ".join(
+                word["text"] for word in column_words
+                if word["text"]
+            )
+
+            if column_text:
+                column_lines.append(column_text)
+
+        columns.append({
+            "index": column_index + 1,
+            "left": left,
+            "right": right,
+            "text": "\n".join(column_lines),
+            "word_count": sum(
+                1 for word in valid_words
+                if left <= (word["x0"] + word["x1"]) / 2 < right
+            ),
+        })
+
+    diagnostics = (
+        f"{len(valid_words)} words | "
+        f"{len(visual_rows)} visual rows | "
+        f"{len(boundaries)} inferred boundaries | "
+        f"{len(columns)} inferred columns"
+    )
+
+    return {
+        "boundaries": accepted_boundaries,
+        "columns": columns,
+        "diagnostics": diagnostics,
+    }
+
+
+
+
 class PDFAnalysisWorker(QThread):
     """Runs PDF analysis without freezing the interface."""
 
@@ -605,6 +871,23 @@ class PDFVisualInspector(QDialog):
 
         layout.addWidget(self.player_entries_table)
 
+        self.column_info_label = QLabel(
+            "Inferred columns will appear here after region selection."
+        )
+
+        layout.addWidget(self.column_info_label)
+
+        self.inferred_columns_table = QTableWidget()
+
+        self.inferred_columns_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+            )
+
+        self.inferred_columns_table.setWordWrap(True)
+        self.inferred_columns_table.setMaximumHeight(220)
+
+        layout.addWidget(self.inferred_columns_table)
+
         # --------------------------------------------------
         # SIGNALS
         # --------------------------------------------------
@@ -749,6 +1032,14 @@ class PDFVisualInspector(QDialog):
 
                 self.region_text_output.clear()
                 self.player_entries_table.setRowCount(0)
+
+                self.column_info_label.setText(
+                    "Inferred columns will appear here after region selection."
+                        )
+
+                self.inferred_columns_table.clear()
+                self.inferred_columns_table.setRowCount(0)
+                self.inferred_columns_table.setColumnCount(0)
 
                 # ------------------------------------------
                 # REBUILD SCENE
@@ -976,6 +1267,46 @@ class PDFVisualInspector(QDialog):
                 )
 
         self.player_entries_table.resizeRowsToContents()
+
+        # ----------------------------------------------
+# INFER AND DISPLAY COLUMN STRUCTURE
+# ----------------------------------------------
+
+        column_result = infer_pdf_columns(
+            selected_words,
+            selection_bbox,
+        )
+
+
+        self.selected_region_data["column_analysis"] = (
+            column_result
+            )
+
+        columns = column_result["columns"]
+
+        self.column_info_label.setText(
+            column_result["diagnostics"]
+            )
+
+        self.inferred_columns_table.clear()
+        self.inferred_columns_table.setRowCount(1)
+        self.inferred_columns_table.setColumnCount(len(columns))
+
+        self.inferred_columns_table.setHorizontalHeaderLabels([
+            f"Column {column['index']}"
+            for column in columns
+            ])
+
+        for column_index, column in enumerate(columns):
+
+            self.inferred_columns_table.setItem(
+                0,
+                column_index,
+                QTableWidgetItem(column["text"]),
+            )
+
+        self.inferred_columns_table.resizeColumnsToContents()
+        self.inferred_columns_table.resizeRowsToContents()
 
     # ======================================================
     # AUTOMATIC STRUCTURE OVERLAYS
