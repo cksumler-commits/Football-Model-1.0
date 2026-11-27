@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
 
 from pdf_structure_analyzer import analyze_pdf_structure
 
+from pdf_document_engine import extract_page_words
+
 from PySide6.QtGui import (
     QColor,
     QPen,
@@ -177,8 +179,9 @@ class SelectableGraphicsView(QGraphicsView):
 
 
 
+
 class PDFVisualInspector(QDialog):
-    """Display a PDF page with automatic structure overlays."""
+    """Display PDF pages, detected structures, and selected-region text."""
 
     RENDER_SCALE = 1.5
 
@@ -195,9 +198,16 @@ class PDFVisualInspector(QDialog):
 
         self.analysis_results = analysis_results
         self.current_path = None
+        self.current_page_number = None
+
+        # Original word-level extraction data for the current page.
+        self.current_page_words = []
+
+        # Structured information from the most recent selection.
+        self.selected_region_data = None
 
         self.setWindowTitle("PDF Visual Inspector")
-        self.resize(1250, 850)
+        self.resize(1250, 950)
 
         self.setup_ui()
 
@@ -205,7 +215,7 @@ class PDFVisualInspector(QDialog):
         layout = QVBoxLayout(self)
 
         # --------------------------------------------------
-        # Controls
+        # DOCUMENT AND PAGE CONTROLS
         # --------------------------------------------------
 
         controls = QHBoxLayout()
@@ -228,7 +238,7 @@ class PDFVisualInspector(QDialog):
         controls.addWidget(self.page_selector)
 
         # --------------------------------------------------
-        # Graphics scene and view
+        # PDF VIEWER
         # --------------------------------------------------
 
         self.scene = QGraphicsScene(self)
@@ -249,7 +259,7 @@ class PDFVisualInspector(QDialog):
         )
 
         # --------------------------------------------------
-        # Region selection button
+        # REGION SELECTION
         # --------------------------------------------------
 
         self.select_region_button = QPushButton(
@@ -268,7 +278,7 @@ class PDFVisualInspector(QDialog):
         layout.addWidget(self.page_view, stretch=1)
 
         # --------------------------------------------------
-        # Information label
+        # DETECTION LEGEND
         # --------------------------------------------------
 
         self.legend_label = QLabel(
@@ -280,7 +290,29 @@ class PDFVisualInspector(QDialog):
         layout.addWidget(self.legend_label)
 
         # --------------------------------------------------
-        # Signals
+        # REGION INFORMATION
+        # --------------------------------------------------
+
+        self.region_info_label = QLabel(
+            "Select a region to extract its text."
+        )
+
+        layout.addWidget(self.region_info_label)
+
+        self.region_text_output = QPlainTextEdit()
+        self.region_text_output.setReadOnly(True)
+
+        self.region_text_output.setPlaceholderText(
+            "Extracted text from your selected PDF region "
+            "will appear here."
+        )
+
+        self.region_text_output.setMaximumHeight(170)
+
+        layout.addWidget(self.region_text_output)
+
+        # --------------------------------------------------
+        # SIGNALS
         # --------------------------------------------------
 
         self.document_selector.currentIndexChanged.connect(
@@ -292,7 +324,7 @@ class PDFVisualInspector(QDialog):
         )
 
         # --------------------------------------------------
-        # Initial document
+        # INITIAL DOCUMENT
         # --------------------------------------------------
 
         if self.document_selector.count():
@@ -308,16 +340,9 @@ class PDFVisualInspector(QDialog):
             self.fit_page_to_view,
         )
 
-    def handle_region_selected(self, rectangle):
-        """Receive a manually selected PDF region."""
-
-        self.legend_label.setText(
-            f"Selected region: "
-            f"X={rectangle.x():.1f}, "
-            f"Y={rectangle.y():.1f}, "
-            f"Width={rectangle.width():.1f}, "
-            f"Height={rectangle.height():.1f}"
-        )
+    # ======================================================
+    # PAGE DISPLAY
+    # ======================================================
 
     def fit_page_to_view(self):
         """Fit the current PDF page inside the available viewport."""
@@ -381,7 +406,12 @@ class PDFVisualInspector(QDialog):
 
         try:
             with pymupdf.open(self.current_path) as document:
+
                 pdf_page = document[page_number - 1]
+
+                # ------------------------------------------
+                # RENDER PDF PAGE
+                # ------------------------------------------
 
                 pixmap = pdf_page.get_pixmap(
                     matrix=pymupdf.Matrix(
@@ -399,17 +429,43 @@ class PDFVisualInspector(QDialog):
                         "Could not render the selected PDF page."
                     )
 
-                # Reset selection before clearing the scene.
+                # ------------------------------------------
+                # EXTRACT ORIGINAL WORD DATA
+                # ------------------------------------------
+
+                self.current_page_words = extract_page_words(
+                    pdf_page
+                )
+
+                self.current_page_number = page_number
+
+                # ------------------------------------------
+                # RESET PREVIOUS SELECTION
+                # ------------------------------------------
+
                 self.page_view.reset_selection()
 
                 self.select_region_button.setChecked(False)
+
+                self.selected_region_data = None
+
+                self.region_info_label.setText(
+                    "Select a region to extract its text."
+                )
+
+                self.region_text_output.clear()
+
+                # ------------------------------------------
+                # REBUILD SCENE
+                # ------------------------------------------
 
                 self.scene.clear()
 
                 page_item = self.scene.addPixmap(image)
 
                 # Convert rendered pixels back into PDF-point
-                # coordinates so overlays use analyzer bboxes.
+                # coordinates so overlays match analyzer bboxes.
+
                 page_item.setScale(
                     1.0 / self.RENDER_SCALE
                 )
@@ -440,14 +496,176 @@ class PDFVisualInspector(QDialog):
                 str(error),
             )
 
+    # ======================================================
+    # MANUAL REGION EXTRACTION
+    # ======================================================
+
+    def handle_region_selected(self, rectangle):
+        """
+        Extract all words intersecting the selected PDF region.
+
+        Original word coordinates and extraction identifiers
+        are preserved in selected_region_data.
+        """
+
+        selection_bbox = [
+            rectangle.left(),
+            rectangle.top(),
+            rectangle.right(),
+            rectangle.bottom(),
+        ]
+
+        selected_words = []
+
+        sx0, sy0, sx1, sy1 = selection_bbox
+
+        for word in self.current_page_words:
+
+            bbox = word.get("bbox")
+
+            if not bbox or len(bbox) != 4:
+                continue
+
+            try:
+                x0, y0, x1, y1 = map(float, bbox)
+
+            except (TypeError, ValueError):
+                continue
+
+            # Check whether the word and selection overlap.
+            intersects = not (
+                x1 <= sx0
+                or x0 >= sx1
+                or y1 <= sy0
+                or y0 >= sy1
+            )
+
+            if intersects:
+                selected_words.append(word)
+
+        # ----------------------------------------------
+        # GROUP WORDS INTO ORIGINAL TEXT LINES
+        # ----------------------------------------------
+
+        line_groups = {}
+
+        for word in selected_words:
+
+            line_key = (
+                word["block_number"],
+                word["line_number"],
+            )
+
+            line_groups.setdefault(
+                line_key,
+                [],
+            ).append(word)
+
+        reconstructed_lines = []
+
+        for line_key, words in line_groups.items():
+
+            # Preserve extraction order within each line.
+            words.sort(
+                key=lambda item: item["word_number"]
+            )
+
+            line_text = " ".join(
+                word["text"]
+                for word in words
+            )
+
+            line_y = min(
+                word["bbox"][1]
+                for word in words
+            )
+
+            line_x = min(
+                word["bbox"][0]
+                for word in words
+            )
+
+            reconstructed_lines.append({
+                "block_number": line_key[0],
+                "line_number": line_key[1],
+                "text": line_text,
+                "words": words,
+                "y": line_y,
+                "x": line_x,
+            })
+
+        # Put reconstructed lines into reading order.
+        reconstructed_lines.sort(
+            key=lambda item: (
+                item["y"],
+                item["x"],
+            )
+        )
+
+        extracted_text = "\n".join(
+            line["text"]
+            for line in reconstructed_lines
+        )
+
+        # ----------------------------------------------
+        # PRESERVE STRUCTURED SELECTION DATA
+        # ----------------------------------------------
+
+        self.selected_region_data = {
+            "file_path": self.current_path,
+            "page_number": self.current_page_number,
+
+            "selection_bbox": selection_bbox,
+
+            "word_count": len(selected_words),
+
+            "line_count": len(reconstructed_lines),
+
+            "text": extracted_text,
+
+            "words": selected_words,
+
+            "lines": reconstructed_lines,
+        }
+
+        # ----------------------------------------------
+        # DISPLAY RESULTS
+        # ----------------------------------------------
+
+        self.region_info_label.setText(
+            f"Page {self.current_page_number} | "
+            f"Words extracted: {len(selected_words)} | "
+            f"Lines reconstructed: {len(reconstructed_lines)} | "
+            f"Region: X={sx0:.1f}, Y={sy0:.1f}, "
+            f"Width={sx1 - sx0:.1f}, "
+            f"Height={sy1 - sy0:.1f}"
+        )
+
+        if extracted_text:
+            self.region_text_output.setPlainText(
+                extracted_text
+            )
+
+        else:
+            self.region_text_output.setPlainText(
+                "No selectable text was found inside this region."
+            )
+
+    # ======================================================
+    # AUTOMATIC STRUCTURE OVERLAYS
+    # ======================================================
+
     def draw_overlays(self, page_data):
         """Draw detected structures over the rendered PDF page."""
 
         for category, style in self.OVERLAY_STYLES.items():
+
             color_hex, _label = style
+
             items = page_data.get(category, [])
 
             for item in items:
+
                 bbox = item.get("bbox")
 
                 if not bbox or len(bbox) != 4:
@@ -492,6 +710,7 @@ class PDFVisualInspector(QDialog):
                 rectangle.setToolTip(
                     item.get("text", category)
                 )
+
 
 
 
