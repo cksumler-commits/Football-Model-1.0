@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QComboBox,
@@ -28,6 +29,8 @@ from PySide6.QtWidgets import (
     QGraphicsScene,
     QGraphicsView,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
 )
 
 from pdf_structure_analyzer import analyze_pdf_structure
@@ -43,6 +46,277 @@ from PySide6.QtGui import (
 )
 import pymupdf
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF
+
+import re
+
+
+
+def detect_player_entries(words, selection_bbox):
+    """
+    Identify candidate player entries using repeated number
+    positions and vertical record boundaries.
+
+    This is structural detection, not final player recognition.
+    """
+
+    sx0, sy0, sx1, sy1 = selection_bbox
+
+    number_candidates = []
+
+    # Step 1: Find possible jersey-number tokens.
+    for word in words:
+        text = word.get("text", "").strip()
+        bbox = word.get("bbox")
+
+        if not bbox or len(bbox) != 4:
+            continue
+
+        if not re.fullmatch(r"#?\d{1,2}", text):
+            continue
+
+        x0, y0, x1, y1 = map(float, bbox)
+
+        number_candidates.append({
+            "text": text.lstrip("#"),
+            "x": x0,
+            "y": (y0 + y1) / 2,
+            "bbox": [x0, y0, x1, y1],
+            "word": word,
+        })
+
+    if not number_candidates:
+        return []
+
+    # Step 2: Group number candidates by horizontal alignment.
+    sorted_candidates = sorted(
+        number_candidates,
+        key=lambda item: item["x"],
+    )
+
+    x_groups = []
+
+    for candidate in sorted_candidates:
+        matching_group = None
+
+        for group in x_groups:
+            group_center = sum(
+                item["x"] for item in group
+            ) / len(group)
+
+            if abs(candidate["x"] - group_center) <= 10:
+                matching_group = group
+                break
+
+        if matching_group is None:
+            x_groups.append([candidate])
+        else:
+            matching_group.append(candidate)
+
+    # Prefer the leftmost repeated number column.
+    repeated_groups = [
+        group for group in x_groups
+        if len(group) >= 2
+    ]
+
+    if repeated_groups:
+        anchor_group = min(
+            repeated_groups,
+            key=lambda group: min(
+                item["x"] for item in group
+            ),
+        )
+    else:
+        anchor_group = [
+            min(
+                number_candidates,
+                key=lambda item: item["x"],
+            )
+        ]
+
+    # Step 3: Sort anchors vertically and remove duplicates.
+    anchors = sorted(
+        anchor_group,
+        key=lambda item: item["y"],
+    )
+
+    unique_anchors = []
+
+    for anchor in anchors:
+        if (
+            unique_anchors
+            and abs(
+                anchor["y"] - unique_anchors[-1]["y"]
+            ) <= 4
+        ):
+            continue
+
+        unique_anchors.append(anchor)
+
+    anchors = unique_anchors
+
+    if not anchors:
+        return []
+
+    records = []
+
+    # Step 4: Divide the selection into candidate record regions.
+    for index, anchor in enumerate(anchors):
+
+        if index == 0:
+            top = sy0
+        else:
+            top = (
+                anchors[index - 1]["y"] + anchor["y"]
+            ) / 2
+
+        if index == len(anchors) - 1:
+            bottom = sy1
+        else:
+            bottom = (
+                anchor["y"] + anchors[index + 1]["y"]
+            ) / 2
+
+        record_words = []
+
+        for word in words:
+            bbox = word.get("bbox")
+
+            if not bbox or len(bbox) != 4:
+                continue
+
+            x0, y0, x1, y1 = map(float, bbox)
+            center_y = (y0 + y1) / 2
+
+            if top <= center_y < bottom:
+                record_words.append(word)
+
+        # Step 5: Reconstruct the text in the candidate record.
+        line_groups = {}
+
+        for word in record_words:
+            key = (
+                word.get("block_number"),
+                word.get("line_number"),
+            )
+
+            line_groups.setdefault(key, []).append(word)
+
+        reconstructed_lines = []
+
+        for line_words in line_groups.values():
+            line_words.sort(
+                key=lambda item: item["bbox"][0]
+            )
+
+            reconstructed_lines.append({
+                "y": min(
+                    item["bbox"][1]
+                    for item in line_words
+                ),
+                "x": min(
+                    item["bbox"][0]
+                    for item in line_words
+                ),
+                "text": " ".join(
+                    item["text"]
+                    for item in line_words
+                ),
+                "words": line_words,
+            })
+
+        reconstructed_lines.sort(
+            key=lambda item: (
+                item["y"],
+                item["x"],
+            )
+        )
+
+        entry_text = "\n".join(
+            line["text"]
+            for line in reconstructed_lines
+        )
+
+        # Step 6: Find the likely player name spatially.
+        # Do not require matching PDF block or line identifiers.
+
+        anchor_x = anchor["bbox"][0]
+        anchor_y = anchor["y"]
+
+        name_candidates = []
+
+        for word in record_words:
+            text = word.get("text", "").strip()
+            bbox = word.get("bbox")
+
+            if not text or not bbox or len(bbox) != 4:
+                continue
+
+            x0, y0, x1, y1 = map(float, bbox)
+            word_center_y = (y0 + y1) / 2
+
+            # Name text should be to the right of the number.
+            if x0 <= anchor_x + 12:
+                continue
+
+            # Keep text reasonably close to the number vertically.
+            if abs(word_center_y - anchor_y) > 30:
+                continue
+
+            # Ignore obvious numeric measurements.
+            if re.fullmatch(r"[\d#./-]+", text):
+                continue
+
+            name_candidates.append({
+                "text": text,
+                "x": x0,
+                "y": word_center_y,
+                "bbox": [x0, y0, x1, y1],
+            })
+
+        # Sort spatially: top-to-bottom, then left-to-right.
+        name_candidates.sort(
+            key=lambda item: (
+                round(item["y"], 1),
+                item["x"],
+            )
+        )
+
+        # Use the closest text row to the jersey number.
+        name_candidate = ""
+
+        if name_candidates:
+            closest_y = min(
+                name_candidates,
+                key=lambda item: abs(
+                    item["y"] - anchor_y
+                ),
+            )["y"]
+
+            closest_row = [
+                item for item in name_candidates
+                if abs(item["y"] - closest_y) <= 3
+            ]
+
+            closest_row.sort(
+                key=lambda item: item["x"]
+            )
+
+            name_candidate = " ".join(
+                item["text"]
+                for item in closest_row
+            )
+
+        records.append({
+            "jersey_candidate": anchor["text"],
+            "name_candidate": name_candidate,
+            "entry_text": entry_text,
+            "word_count": len(record_words),
+            "bbox": [sx0, top, sx1, bottom],
+        })
+
+    return records
+
+
 
 class PDFAnalysisWorker(QThread):
     """Runs PDF analysis without freezing the interface."""
@@ -310,6 +584,26 @@ class PDFVisualInspector(QDialog):
         self.region_text_output.setMaximumHeight(170)
 
         layout.addWidget(self.region_text_output)
+        self.player_entries_table = QTableWidget()
+
+        self.player_entries_table.setColumnCount(4)
+
+        self.player_entries_table.setHorizontalHeaderLabels([
+            "Jersey Candidate",
+            "Name Candidate",
+            "Entry Text",
+            "Word Count",
+            ])
+
+        self.player_entries_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+            )
+
+        self.player_entries_table.setWordWrap(True)
+
+        self.player_entries_table.setMaximumHeight(230)
+
+        layout.addWidget(self.player_entries_table)
 
         # --------------------------------------------------
         # SIGNALS
@@ -454,6 +748,7 @@ class PDFVisualInspector(QDialog):
                 )
 
                 self.region_text_output.clear()
+                self.player_entries_table.setRowCount(0)
 
                 # ------------------------------------------
                 # REBUILD SCENE
@@ -650,6 +945,37 @@ class PDFVisualInspector(QDialog):
             self.region_text_output.setPlainText(
                 "No selectable text was found inside this region."
             )
+                # Detect candidate player entries within this region.
+        player_entries = detect_player_entries(
+            selected_words,
+            selection_bbox,
+        )
+
+        self.selected_region_data["player_entries"] = (
+            player_entries
+        )
+
+        self.player_entries_table.setRowCount(
+            len(player_entries)
+        )
+
+        for row, entry in enumerate(player_entries):
+
+            values = [
+                entry["jersey_candidate"],
+                entry["name_candidate"],
+                entry["entry_text"],
+                str(entry["word_count"]),
+            ]
+
+            for column, value in enumerate(values):
+                self.player_entries_table.setItem(
+                    row,
+                    column,
+                    QTableWidgetItem(value),
+                )
+
+        self.player_entries_table.resizeRowsToContents()
 
     # ======================================================
     # AUTOMATIC STRUCTURE OVERLAYS
