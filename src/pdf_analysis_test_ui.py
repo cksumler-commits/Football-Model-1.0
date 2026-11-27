@@ -1,5 +1,5 @@
 
-from curses.textpad import rectangle
+
 import sys
 from tkinter import dialog
 import traceback
@@ -33,6 +33,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
 )
+from numpy import record
+from numpy import record
 
 from pdf_structure_analyzer import analyze_pdf_structure
 
@@ -50,7 +52,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF
 
 import re
 
-
+from roster_pdf_reconstruction import reconstruct_pdf_roster_cells
 
 
 def classify_roster_layout(words, selection_bbox):
@@ -3319,13 +3321,48 @@ class PDFVisualInspector(QDialog):
 # SEMANTIC ANALYSIS OF CANDIDATE RECORDS
 # --------------------------------------------------
 
+        # --------------------------------------------------
+# RECONSTRUCT SPATIAL PDF CELLS
+# --------------------------------------------------
+
+        cell_reconstruction = reconstruct_pdf_roster_cells(
+            player_entries,
+            layout_result,
+        )
+
+        self.selected_region_data["cell_reconstruction"] = (
+            cell_reconstruction
+)
+
+        semantic_input_records = cell_reconstruction.get(
+            "records",
+            player_entries,
+        )
+
+
+# --------------------------------------------------
+# ANALYZE RECONSTRUCTED CELL VALUES
+# --------------------------------------------------
+
         semantic_result = analyze_pdf_roster_values(
-            player_entries
-            )
+            semantic_input_records
+        )
 
         self.selected_region_data["semantic_analysis"] = (
             semantic_result
         )
+
+# --------------------------------------------------
+# RESOLVE CANDIDATE ROSTER FIELDS
+# --------------------------------------------------
+
+        field_resolution = resolve_pdf_roster_fields(
+            semantic_result
+            )
+
+        self.selected_region_data["field_resolution"] = (
+            field_resolution
+                )
 
 # --------------------------------------------------
 # RESOLVE CANDIDATE ROSTER FIELDS
@@ -3343,22 +3380,50 @@ class PDFVisualInspector(QDialog):
     # 5. Populate the candidate player-entry table.
     # --------------------------------------------------
 
+        # --------------------------------------------------
+# DISPLAY RECONSTRUCTED PLAYER RECORDS
+# --------------------------------------------------
+
+        reconstructed_records = cell_reconstruction.get(
+            "records",
+                [],
+                )
+
         self.roster_table.clear()
         self.roster_table.setRowCount(len(player_entries))
-        self.roster_table.setColumnCount(4)
+        self.roster_table.setColumnCount(5)
 
         self.roster_table.setHorizontalHeaderLabels([
-            "Jersey Candidate",
-            "Name Candidate",
-            "Entry Text",
-            "Word Count",
-        ])
+        "Jersey Candidate",
+    "Name Candidate",
+    "Reconstructed Cells",
+    "Original Entry Text",
+    "Word Count",
+])
 
         for row_index, record in enumerate(player_entries):
+
+            reconstructed_record = (
+                reconstructed_records[row_index]
+                if row_index < len(reconstructed_records)
+                else {}
+            )
+
+            cells = reconstructed_record.get("cells", [])
+
+            cell_summary = "\n".join(
+        (
+            f"Column {cell['column_index'] + 1}: "
+            f"{cell['text'].replace(chr(10), ' / ')}"
+        )
+            for cell in cells
+                if cell.get("text")
+            )
 
             values = [
                 record.get("jersey_candidate", ""),
                 record.get("name_candidate", ""),
+                cell_summary,
                 record.get("entry_text", ""),
                 str(record.get("word_count", 0)),
             ]
@@ -3375,12 +3440,11 @@ class PDFVisualInspector(QDialog):
                 self.roster_table.setItem(
                     row_index,
                     column_index,
-                    item
+                    item,
                 )
 
         self.roster_table.resizeRowsToContents()
         self.roster_table.resizeColumnsToContents()
-
     # --------------------------------------------------
     # 6. Preserve unresolved content.
     # --------------------------------------------------
@@ -3440,13 +3504,20 @@ class PDFVisualInspector(QDialog):
             "No segmentation diagnostics available.",
         )
 
+        cell_diagnostics = cell_reconstruction.get(
+    "diagnostics",
+    {},
+)
+
         layout_summary = (
             f"Layout: {layout_type.replace('_', ' ').title()} "
             f"({layout_confidence:.0%} confidence)\n"
-            f"Candidate records: {len(player_entries)}\n"
-            f"{segmentation_diagnostics}"
-        )
-
+    f"Candidate records: {len(player_entries)}\n"
+    f"Inferred columns: "
+    f"{cell_diagnostics.get('column_count', 0)}\n"
+    f"{cell_diagnostics.get('reason', '')}\n"
+    f"{segmentation_diagnostics}"
+)
         self.column_info_label.setText(
             layout_summary
         )
