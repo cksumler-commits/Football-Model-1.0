@@ -111,11 +111,11 @@ def get_player_anchors(words):
 
         if (
             CARD_NUMBER_X_MIN <= x0 <= CARD_NUMBER_X_MAX
-            and re.fullmatch(r"\d{1,2}", text)
+            and re.fullmatch(r"#?\d{1,2}", text)
             and y0 < 740
         ):
             anchors.append({
-                "number": text,
+                "number": text.lstrip("#"),
                 "y": (y0 + y1) / 2,
             })
 

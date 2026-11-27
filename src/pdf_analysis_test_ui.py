@@ -1,13 +1,16 @@
 
 import sys
+from tkinter import dialog
 import traceback
 from pathlib import Path
 from unittest import result
+from PySide6.QtCore import Qt
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -20,10 +23,23 @@ from PySide6.QtWidgets import (
     QPushButton,
     QVBoxLayout,
     QWidget,
+    QComboBox,
+    QDialog,
+    QGraphicsScene,
+    QGraphicsView,
+    QSpinBox,
 )
 
 from pdf_structure_analyzer import analyze_pdf_structure
 
+from PySide6.QtGui import (
+    QColor,
+    QPen,
+    QBrush,
+    QPixmap,
+    QPainter,
+)
+import pymupdf
 
 
 class PDFAnalysisWorker(QThread):
@@ -54,6 +70,232 @@ class PDFAnalysisWorker(QThread):
                 self.error_ready.emit(pdf_path, error_details)
 
 
+
+class PDFVisualInspector(QDialog):
+    """Display a PDF page with automatic structure overlays."""
+
+    RENDER_SCALE = 1.5
+
+    OVERLAY_STYLES = {
+        "tables": ("#16a34a", "Tables"),
+        "containers": ("#2563eb", "Containers"),
+        "separator_regions": ("#d97706", "Separator regions"),
+        "text_regions": ("#9333ea", "Text regions"),
+        "unassigned_text": ("#dc2626", "Unassigned text"),
+    }
+
+    def __init__(self, analysis_results, parent=None):
+        super().__init__(parent)
+
+        self.analysis_results = analysis_results
+        self.current_path = None
+
+        self.setWindowTitle("PDF Visual Inspector")
+        self.resize(1250, 850)
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+
+        self.document_selector = QComboBox()
+
+        for path, result in self.analysis_results.items():
+            self.document_selector.addItem(
+                result.get("file_name", Path(path).name),
+                path,
+            )
+
+        self.page_selector = QSpinBox()
+        self.page_selector.setMinimum(1)
+        self.page_selector.setMaximum(1)
+
+        controls.addWidget(QLabel("Document:"))
+        controls.addWidget(self.document_selector, stretch=1)
+        controls.addWidget(QLabel("Page:"))
+        controls.addWidget(self.page_selector)
+
+        layout.addLayout(controls)
+
+        self.scene = QGraphicsScene(self)
+
+        self.page_view = QGraphicsView(self.scene)
+        self.page_view.setRenderHint(
+            QPainter.RenderHint.Antialiasing,
+                True,
+                )
+        self.page_view.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag
+        )
+
+        layout.addWidget(self.page_view, stretch=1)
+
+        self.legend_label = QLabel(
+            "Green: Tables | Blue: Containers | "
+            "Orange: Separator regions | "
+            "Purple: Text regions | Red: Unassigned text"
+        )
+        layout.addWidget(self.legend_label)
+
+        self.document_selector.currentIndexChanged.connect(
+            self.load_document
+        )
+
+        self.page_selector.valueChanged.connect(
+            self.load_page
+        )
+
+        if self.document_selector.count():
+            self.load_document(0)
+
+    def load_document(self, index):
+        if index < 0:
+            return
+
+        path = self.document_selector.itemData(index)
+
+        if not path:
+            return
+
+        result = self.analysis_results.get(path)
+
+        if not result:
+            return
+
+        self.current_path = path
+
+        page_count = result.get("page_count", 0)
+
+        self.page_selector.blockSignals(True)
+        self.page_selector.setRange(
+            1,
+            max(1, page_count),
+        )
+        self.page_selector.setValue(1)
+        self.page_selector.blockSignals(False)
+
+        self.load_page(1)
+
+    def load_page(self, page_number):
+        if not self.current_path:
+            return
+
+        result = self.analysis_results.get(
+            self.current_path
+        )
+
+        if not result:
+            return
+
+        pages = result.get("pages", [])
+
+        if not 1 <= page_number <= len(pages):
+            return
+
+        try:
+            with pymupdf.open(self.current_path) as document:
+                pdf_page = document[page_number - 1]
+
+                pixmap = pdf_page.get_pixmap(
+                    matrix=pymupdf.Matrix(
+                        self.RENDER_SCALE,
+                        self.RENDER_SCALE,
+                    ),
+                    alpha=False,
+                )
+
+                image = QPixmap()
+                image.loadFromData(pixmap.tobytes("png"))
+
+                if image.isNull():
+                    raise RuntimeError(
+                        "Could not render the selected PDF page."
+                    )
+
+                self.scene.clear()
+
+                page_item = self.scene.addPixmap(image)
+
+                # Convert rendered pixels back into PDF-point
+                # coordinates so overlays use analyzer bboxes.
+                page_item.setScale(
+                    1.0 / self.RENDER_SCALE
+                )
+
+                self.draw_overlays(
+                    pages[page_number - 1]
+                )
+
+                self.scene.setSceneRect(page_item.sceneBoundingRect())
+
+                self.page_view.fitInView(
+                    self.scene.sceneRect(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                        )
+
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                "Page Rendering Error",
+                str(error),
+            )
+
+    def draw_overlays(self, page_data):
+        for category, style in self.OVERLAY_STYLES.items():
+            color_hex, _label = style
+            items = page_data.get(category, [])
+
+            for item in items:
+                bbox = item.get("bbox")
+
+                if not bbox or len(bbox) != 4:
+                    continue
+
+                try:
+                    x0, y0, x1, y1 = map(float, bbox)
+                except (TypeError, ValueError):
+                    continue
+
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                color = QColor(color_hex)
+
+                pen = QPen(color, 1.5)
+
+                if category == "unassigned_text":
+                    pen.setStyle(
+                        Qt.PenStyle.DashLine
+                        )
+
+                brush = QBrush(
+                    QColor(
+                        color.red(),
+                        color.green(),
+                        color.blue(),
+                        28,
+                    )
+                )
+
+                rectangle = self.scene.addRect(
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    pen,
+                    brush,
+                )
+
+                rectangle.setToolTip(
+                    item.get("text", category)
+                )
+
+
+
+
+
 class PDFAnalysisTestWindow(QMainWindow):
     """Standalone interface for testing the universal PDF analyzer."""
 
@@ -65,6 +307,7 @@ class PDFAnalysisTestWindow(QMainWindow):
 
         self.worker = None
         self.analysis_summaries = []
+        self.analysis_results = {}
 
         self.setup_ui()
 
@@ -172,6 +415,17 @@ class PDFAnalysisTestWindow(QMainWindow):
         control_layout.addWidget(self.analyze_button)
         control_layout.addWidget(self.status_label)
         control_layout.addStretch()
+        self.inspect_button = QPushButton(
+    "Open Visual Inspector"
+)
+
+        self.inspect_button.setEnabled(False)
+
+        self.inspect_button.clicked.connect(
+            self.open_visual_inspector
+            )
+
+        control_layout.addWidget(self.inspect_button)
 
         main_layout.addLayout(control_layout)
 
@@ -319,6 +573,7 @@ class PDFAnalysisTestWindow(QMainWindow):
         # Reset previous session data.
         self.results_output.clear()
         self.analysis_summaries.clear()
+        self.analysis_results.clear()
 
         self.results_output.appendPlainText(
             "=" * 110
@@ -384,7 +639,7 @@ class PDFAnalysisTestWindow(QMainWindow):
         Collects document metrics without printing
         detailed diagnostics for every PDF.
         """
-
+        self.analysis_results[pdf_path] = result
         filename = Path(pdf_path).name
 
         # Handle unexpected analyzer output.
@@ -888,6 +1143,23 @@ class PDFAnalysisTestWindow(QMainWindow):
 
         self.worker = None
 
+    def open_visual_inspector(self):
+        if not self.analysis_results:
+            QMessageBox.information(
+                self,
+                "No Analysis Available",
+                "Analyze at least one PDF before opening "
+                "the visual inspector.",
+            )
+            return
+
+        dialog = PDFVisualInspector(
+            self.analysis_results,
+            self,
+    )
+
+        dialog.exec()
+
     # ======================================================
     # WORKER STATE
     # ======================================================
@@ -901,6 +1173,10 @@ class PDFAnalysisTestWindow(QMainWindow):
 
         self.analyze_button.setEnabled(
             enabled and self.file_list.count() > 0
+        )
+
+        self.inspect_button.setEnabled(
+            enabled and bool(self.analysis_results)
         )
 
     def closeEvent(self, event):
