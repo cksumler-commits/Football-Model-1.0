@@ -4,7 +4,7 @@ from tkinter import dialog
 import traceback
 from pathlib import Path
 from unittest import result
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, QTimer, Qt
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -40,7 +40,7 @@ from PySide6.QtGui import (
     QPainter,
 )
 import pymupdf
-
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF
 
 class PDFAnalysisWorker(QThread):
     """Runs PDF analysis without freezing the interface."""
@@ -71,6 +71,112 @@ class PDFAnalysisWorker(QThread):
 
 
 
+class SelectableGraphicsView(QGraphicsView):
+    """Graphics view supporting optional rectangular selection."""
+
+    region_selected = Signal(object)
+
+    def __init__(self, scene, parent=None):
+        super().__init__(scene, parent)
+
+        self.selection_mode = False
+        self.selection_origin = None
+        self.selection_rectangle = None
+
+        self.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag
+        )
+
+    def set_selection_mode(self, enabled):
+        self.selection_mode = enabled
+
+        if enabled:
+            self.setDragMode(
+                QGraphicsView.DragMode.NoDrag
+            )
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setDragMode(
+                QGraphicsView.DragMode.ScrollHandDrag
+            )
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if (
+            self.selection_mode
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.selection_origin = self.mapToScene(
+                event.position().toPoint()
+            )
+
+            if self.selection_rectangle:
+                self.scene().removeItem(
+                    self.selection_rectangle
+                )
+                self.selection_rectangle = None
+
+            return
+
+        super().mousePressEvent(event)
+
+
+    def reset_selection(self):
+        """Clear any active or previously drawn selection."""
+
+        self.selection_origin = None
+        self.selection_rectangle = None
+
+    def mouseMoveEvent(self, event):
+        if self.selection_mode and self.selection_origin:
+            current_position = self.mapToScene(
+                event.position().toPoint()
+            )
+
+            rectangle = QRectF(
+                self.selection_origin,
+                current_position,
+            ).normalized()
+
+            if self.selection_rectangle is None:
+                self.selection_rectangle = self.scene().addRect(
+                    rectangle,
+                    QPen(QColor("#facc15"), 2),
+                    QBrush(QColor(250, 204, 21, 35)),
+                )
+            else:
+                self.selection_rectangle.setRect(rectangle)
+
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self.selection_mode
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.selection_origin is not None
+        ):
+            current_position = self.mapToScene(
+                event.position().toPoint()
+            )
+
+            rectangle = QRectF(
+                self.selection_origin,
+                current_position,
+            ).normalized()
+
+            self.selection_origin = None
+
+            if rectangle.width() > 3 and rectangle.height() > 3:
+                self.region_selected.emit(rectangle)
+
+            return
+
+        super().mouseReleaseEvent(event)
+
+
+
 class PDFVisualInspector(QDialog):
     """Display a PDF page with automatic structure overlays."""
 
@@ -98,6 +204,10 @@ class PDFVisualInspector(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
+        # --------------------------------------------------
+        # Controls
+        # --------------------------------------------------
+
         controls = QHBoxLayout()
 
         self.document_selector = QComboBox()
@@ -117,27 +227,61 @@ class PDFVisualInspector(QDialog):
         controls.addWidget(QLabel("Page:"))
         controls.addWidget(self.page_selector)
 
-        layout.addLayout(controls)
+        # --------------------------------------------------
+        # Graphics scene and view
+        # --------------------------------------------------
 
         self.scene = QGraphicsScene(self)
 
-        self.page_view = QGraphicsView(self.scene)
+        self.page_view = SelectableGraphicsView(self.scene)
+
+        self.page_view.region_selected.connect(
+            self.handle_region_selected
+        )
+
         self.page_view.setRenderHint(
             QPainter.RenderHint.Antialiasing,
-                True,
-                )
+            True,
+        )
+
         self.page_view.setDragMode(
             QGraphicsView.DragMode.ScrollHandDrag
         )
 
+        # --------------------------------------------------
+        # Region selection button
+        # --------------------------------------------------
+
+        self.select_region_button = QPushButton(
+            "Select Region"
+        )
+
+        self.select_region_button.setCheckable(True)
+
+        self.select_region_button.toggled.connect(
+            self.page_view.set_selection_mode
+        )
+
+        controls.addWidget(self.select_region_button)
+
+        layout.addLayout(controls)
         layout.addWidget(self.page_view, stretch=1)
+
+        # --------------------------------------------------
+        # Information label
+        # --------------------------------------------------
 
         self.legend_label = QLabel(
             "Green: Tables | Blue: Containers | "
             "Orange: Separator regions | "
             "Purple: Text regions | Red: Unassigned text"
         )
+
         layout.addWidget(self.legend_label)
+
+        # --------------------------------------------------
+        # Signals
+        # --------------------------------------------------
 
         self.document_selector.currentIndexChanged.connect(
             self.load_document
@@ -147,8 +291,46 @@ class PDFVisualInspector(QDialog):
             self.load_page
         )
 
+        # --------------------------------------------------
+        # Initial document
+        # --------------------------------------------------
+
         if self.document_selector.count():
             self.load_document(0)
+
+    def showEvent(self, event):
+        """Fit the PDF after the dialog becomes visible."""
+
+        super().showEvent(event)
+
+        QTimer.singleShot(
+            0,
+            self.fit_page_to_view,
+        )
+
+    def handle_region_selected(self, rectangle):
+        """Receive a manually selected PDF region."""
+
+        self.legend_label.setText(
+            f"Selected region: "
+            f"X={rectangle.x():.1f}, "
+            f"Y={rectangle.y():.1f}, "
+            f"Width={rectangle.width():.1f}, "
+            f"Height={rectangle.height():.1f}"
+        )
+
+    def fit_page_to_view(self):
+        """Fit the current PDF page inside the available viewport."""
+
+        scene_rect = self.scene.sceneRect()
+
+        if scene_rect.isNull() or scene_rect.isEmpty():
+            return
+
+        self.page_view.fitInView(
+            scene_rect,
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
 
     def load_document(self, index):
         if index < 0:
@@ -169,11 +351,14 @@ class PDFVisualInspector(QDialog):
         page_count = result.get("page_count", 0)
 
         self.page_selector.blockSignals(True)
+
         self.page_selector.setRange(
             1,
             max(1, page_count),
         )
+
         self.page_selector.setValue(1)
+
         self.page_selector.blockSignals(False)
 
         self.load_page(1)
@@ -214,6 +399,11 @@ class PDFVisualInspector(QDialog):
                         "Could not render the selected PDF page."
                     )
 
+                # Reset selection before clearing the scene.
+                self.page_view.reset_selection()
+
+                self.select_region_button.setChecked(False)
+
                 self.scene.clear()
 
                 page_item = self.scene.addPixmap(image)
@@ -228,12 +418,20 @@ class PDFVisualInspector(QDialog):
                     pages[page_number - 1]
                 )
 
-                self.scene.setSceneRect(page_item.sceneBoundingRect())
+                self.scene.setSceneRect(
+                    page_item.sceneBoundingRect()
+                )
 
                 self.page_view.fitInView(
                     self.scene.sceneRect(),
                     Qt.AspectRatioMode.KeepAspectRatio,
-                        )
+                )
+
+                self.legend_label.setText(
+                    "Green: Tables | Blue: Containers | "
+                    "Orange: Separator regions | "
+                    "Purple: Text regions | Red: Unassigned text"
+                )
 
         except Exception as error:
             QMessageBox.critical(
@@ -243,6 +441,8 @@ class PDFVisualInspector(QDialog):
             )
 
     def draw_overlays(self, page_data):
+        """Draw detected structures over the rendered PDF page."""
+
         for category, style in self.OVERLAY_STYLES.items():
             color_hex, _label = style
             items = page_data.get(category, [])
@@ -255,6 +455,7 @@ class PDFVisualInspector(QDialog):
 
                 try:
                     x0, y0, x1, y1 = map(float, bbox)
+
                 except (TypeError, ValueError):
                     continue
 
@@ -268,7 +469,7 @@ class PDFVisualInspector(QDialog):
                 if category == "unassigned_text":
                     pen.setStyle(
                         Qt.PenStyle.DashLine
-                        )
+                    )
 
                 brush = QBrush(
                     QColor(
@@ -291,7 +492,6 @@ class PDFVisualInspector(QDialog):
                 rectangle.setToolTip(
                     item.get("text", category)
                 )
-
 
 
 
