@@ -2796,8 +2796,9 @@ class SelectableGraphicsView(QGraphicsView):
 
 
 
+
 class PDFVisualInspector(QDialog):
-    """Automatic full-document roster reconstruction with manual recovery."""
+    """Display automatic grouped roster records and supplemental recovery."""
 
     RENDER_SCALE = 1.5
 
@@ -2824,8 +2825,8 @@ class PDFVisualInspector(QDialog):
         self.roster_results = {}
         self.recovery_results = []
 
-        self.setWindowTitle("PDF Visual Inspector — Automatic Roster Analysis")
-        self.resize(1450, 950)
+        self.setWindowTitle("PDF Visual Inspector — Grouped Roster Analysis")
+        self.resize(1500, 950)
 
         self.setup_ui()
 
@@ -2848,7 +2849,9 @@ class PDFVisualInspector(QDialog):
         self.page_selector.setMinimum(1)
         self.page_selector.setMaximum(1)
 
-        self.select_region_button = QPushButton("Select Recovery Region")
+        self.select_region_button = QPushButton(
+            "Select Recovery Region"
+        )
         self.select_region_button.setCheckable(True)
 
         self.document_status_label = QLabel(
@@ -2884,7 +2887,9 @@ class PDFVisualInspector(QDialog):
             self.page_view.set_selection_mode
         )
 
-        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter = QSplitter(
+            Qt.Orientation.Horizontal
+        )
         self.workspace_splitter.addWidget(self.page_view)
 
         self.results_panel = QWidget()
@@ -2892,13 +2897,14 @@ class PDFVisualInspector(QDialog):
         results_layout.setContentsMargins(6, 6, 6, 6)
 
         results_layout.addWidget(
-            QLabel("Automatic Candidate Rows")
+            QLabel("Grouped Candidate Player Records")
         )
 
         self.column_info_label = QLabel(
-            "Open a document to begin full-document analysis."
+            "Open a document to begin automatic analysis."
         )
         self.column_info_label.setWordWrap(True)
+
         results_layout.addWidget(self.column_info_label)
 
         self.roster_table = CopyableTableWidget()
@@ -2912,12 +2918,16 @@ class PDFVisualInspector(QDialog):
             QAbstractItemView.SelectionBehavior.SelectItems
         )
         self.roster_table.setWordWrap(True)
+
         self.roster_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
         )
         self.roster_table.horizontalHeader().setStretchLastSection(True)
 
-        results_layout.addWidget(self.roster_table, stretch=3)
+        results_layout.addWidget(
+            self.roster_table,
+            stretch=3,
+        )
 
         results_layout.addWidget(
             QLabel("Unassigned / Review Content")
@@ -2926,7 +2936,7 @@ class PDFVisualInspector(QDialog):
         self.unassigned_output = QPlainTextEdit()
         self.unassigned_output.setReadOnly(True)
         self.unassigned_output.setPlaceholderText(
-            "Headers, uncertain content, and supplemental "
+            "Headers, metadata, unassigned rows, and supplemental "
             "recovery results will appear here."
         )
 
@@ -2938,9 +2948,12 @@ class PDFVisualInspector(QDialog):
         self.workspace_splitter.addWidget(self.results_panel)
         self.workspace_splitter.setStretchFactor(0, 1)
         self.workspace_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.setSizes([650, 800])
+        self.workspace_splitter.setSizes([650, 850])
 
-        layout.addWidget(self.workspace_splitter, stretch=1)
+        layout.addWidget(
+            self.workspace_splitter,
+            stretch=1,
+        )
 
         self.document_selector.currentIndexChanged.connect(
             self.load_document
@@ -2979,10 +2992,10 @@ class PDFVisualInspector(QDialog):
 
         self.current_path = path
 
-        # Analyze once per document during this inspector session.
         if path not in self.roster_results:
             self.document_status_label.setText(
-                f"Automatically analyzing all pages in {Path(path).name}..."
+                f"Automatically analyzing all pages in "
+                f"{Path(path).name}..."
             )
             QApplication.processEvents()
 
@@ -3019,11 +3032,18 @@ class PDFVisualInspector(QDialog):
             f"Automatic analysis complete | "
             f"{page_count} pages | "
             f"{diagnostics.get('total_candidate_records', 0)} "
-            f"candidate rows | "
+            f"grouped candidate records | "
             f"{diagnostics.get('total_words', 0)} extracted words"
         )
 
-        self.load_page(1)
+        if page_count:
+            self.load_page(1)
+        else:
+            self.roster_table.setRowCount(0)
+            self.roster_table.setColumnCount(0)
+            self.column_info_label.setText(
+                diagnostics.get("message", "No pages were analyzed.")
+            )
 
     def load_page(self, page_number):
         if not self.current_path:
@@ -3121,10 +3141,14 @@ class PDFVisualInspector(QDialog):
             default=0,
         )
 
-        headers = ["Page", "Visual Row", "Confidence"]
+        headers = [
+            "Candidate",
+            "Source Rows",
+            "Confidence",
+        ]
 
         headers.extend(
-            f"Source Column {index + 1}"
+            f"Reconstructed Column {index + 1}"
             for index in range(maximum_columns)
         )
 
@@ -3134,10 +3158,18 @@ class PDFVisualInspector(QDialog):
         self.roster_table.setRowCount(len(records))
 
         for row_index, record in enumerate(records):
+            source_rows = ", ".join(
+                str(index + 1)
+                for index in record.get("row_indices", [])
+            )
+
             values = [
-                str(record.get("page_number", "")),
-                str(record.get("row_index", "")),
-                record.get("confidence", "unknown"),
+                record.get("record_id", ""),
+                source_rows,
+                (
+                    f"{record.get('confidence', 'unknown')} "
+                    f"({record.get('confidence_score', 0):.0%})"
+                ),
             ]
 
             cells = record.get("cells", [])
@@ -3153,11 +3185,35 @@ class PDFVisualInspector(QDialog):
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
 
-                item.setToolTip(
-                    f"Record: {record.get('record_id', '')}\n"
-                    f"Bounding box: {record.get('bbox', [])}\n"
-                    f"Source word count: {record.get('word_count', 0)}"
-                )
+                if column_index >= 3:
+                    cell_index = column_index - 3
+
+                    if cell_index < len(cells):
+                        cell = cells[cell_index]
+
+                        fragment_details = "\n".join(
+                            (
+                                f"Visual row {fragment['row_index'] + 1}: "
+                                f"{fragment['text']}"
+                            )
+                            for fragment in cell.get("fragments", [])
+                        )
+
+                        item.setToolTip(
+                            f"Combined value: {cell.get('text', '')}\n"
+                            f"Original fragments:\n{fragment_details}\n"
+                            f"Bounding box: {cell.get('bbox', [])}\n"
+                            f"Source words: {cell.get('word_count', 0)}"
+                        )
+
+                else:
+                    item.setToolTip(
+                        f"Record: {record.get('record_id', '')}\n"
+                        f"Bounding box: {record.get('bbox', [])}\n"
+                        f"Source rows: {record.get('row_indices', [])}\n"
+                        f"Source word count: {record.get('word_count', 0)}\n"
+                        f"Features: {record.get('record_features', {})}"
+                    )
 
                 self.roster_table.setItem(
                     row_index,
@@ -3172,17 +3228,30 @@ class PDFVisualInspector(QDialog):
             f"Page {page_number} | "
             f"{diagnostics.get('word_count', 0)} words | "
             f"{diagnostics.get('row_count', 0)} visual rows | "
-            f"{diagnostics.get('record_count', 0)} candidate rows | "
-            f"{diagnostics.get('column_count', 0)} inferred columns\n"
+            f"{diagnostics.get('record_count', 0)} grouped candidates | "
+            f"{diagnostics.get('column_count', 0)} inferred columns | "
+            f"{diagnostics.get('anchor_count', 0)} record anchors\n"
             f"{diagnostics.get('reason', '')}"
         )
 
         review_lines = []
 
-        if page_data.get("unassigned_text", "").strip():
+        unassigned_content = page_data.get(
+            "unassigned_content", []
+        )
+
+        if unassigned_content:
             review_lines.append(
-                "HEADER / UNASSIGNED ROWS:\n"
-                + page_data["unassigned_text"]
+                "UNASSIGNED / NON-PLAYER CONTENT:"
+            )
+
+            review_lines.extend(
+                (
+                    f"Row {item.get('row_index', '?') + 1} "
+                    f"[{item.get('reason', 'unassigned')}]: "
+                    f"{item.get('text', '')}"
+                )
+                for item in unassigned_content
             )
 
         low_confidence = [
@@ -3191,10 +3260,15 @@ class PDFVisualInspector(QDialog):
         ]
 
         if low_confidence:
-            review_lines.append("LOW-CONFIDENCE CANDIDATE ROWS:")
+            review_lines.append(
+                "\nCANDIDATES REQUIRING REVIEW:"
+            )
 
             review_lines.extend(
-                f"Row {record.get('row_index')}: {record.get('text')}"
+                (
+                    f"{record.get('record_id')}: "
+                    f"{record.get('text', '')}"
+                )
                 for record in low_confidence
             )
 
@@ -3206,7 +3280,7 @@ class PDFVisualInspector(QDialog):
 
         if page_recoveries:
             review_lines.append(
-                "SUPPLEMENTAL REGION RECOVERY RESULTS:"
+                "\nSUPPLEMENTAL REGION RECOVERY:"
             )
 
             for recovery in page_recoveries:
@@ -3215,8 +3289,14 @@ class PDFVisualInspector(QDialog):
                     for record in recovery.get("records", [])
                 )
 
+            for recovery in page_recoveries:
+                review_lines.extend(
+                    item.get("text", "")
+                    for item in recovery.get("unassigned_content", [])
+                )
+
         self.unassigned_output.setPlainText(
-            "\n\n".join(review_lines)
+            "\n".join(review_lines)
         )
 
     def handle_region_selected(self, rectangle):
@@ -3246,7 +3326,7 @@ class PDFVisualInspector(QDialog):
 
         self.document_status_label.setText(
             "Selected region analyzed as supplemental recovery. "
-            "The automatic full-page results remain intact."
+            "Automatic full-page results remain unchanged."
         )
 
     def draw_overlays(self, page_data):
@@ -3296,7 +3376,6 @@ class PDFVisualInspector(QDialog):
                 rectangle.setToolTip(
                     item.get("text", category)
                 )
-
 
 
 

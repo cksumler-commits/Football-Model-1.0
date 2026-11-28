@@ -894,6 +894,493 @@ class StructuredDataExtractor:
 
     
 
+class PatternExtractor:
+
+    """
+    Fallback extractor for roster pages that do not use
+    recognizable HTML tables or standard player-card classes.
+
+    It identifies player-name links, searches their surrounding
+    HTML for repeated player information, and extracts whatever
+    fields can be recognized with reasonable confidence.
+    """
+
+    NAME_BLACKLIST = {
+        "football roster",
+        "view roster",
+        "full roster",
+        "coaching staff",
+        "support staff",
+        "team roster",
+        "view profile",
+        "full bio",
+        "read more",
+        "schedule",
+        "statistics",
+    }
+
+    CLASS_PATTERNS = [
+        r"\bredshirt\s+(?:freshman|sophomore|junior|senior)\b",
+        r"\b(?:freshman|sophomore|junior|senior)\b",
+        r"\b(?:fifth|sixth|seventh)\s+year\b",
+        r"\bgraduate\s+student\b",
+        r"\b(?:1st|2nd|3rd|4th|5th|6th)\b",
+    ]
+
+    POSITION_PATTERNS = [
+        ("OFFENSIVE LINE", "OL"),
+        ("DEFENSIVE LINE", "DL"),
+        ("WIDE RECEIVER", "WR"),
+        ("RUNNING BACK", "RB"),
+        ("TIGHT END", "TE"),
+        ("QUARTERBACK", "QB"),
+        ("LINEBACKER", "LB"),
+        ("CORNERBACK", "CB"),
+        ("SAFETY", "S"),
+        ("FULLBACK", "FB"),
+        ("KICKER", "K"),
+        ("PUNTER", "P"),
+        ("LONG SNAPPER", "LS"),
+        ("QB", "QB"),
+        ("RB", "RB"),
+        ("HB", "RB"),
+        ("FB", "FB"),
+        ("WR", "WR"),
+        ("TE", "TE"),
+        ("OL", "OL"),
+        ("OT", "OT"),
+        ("OG", "OG"),
+        ("C", "C"),
+        ("DL", "DL"),
+        ("DE", "DE"),
+        ("DT", "DT"),
+        ("NT", "NT"),
+        ("LB", "LB"),
+        ("ILB", "ILB"),
+        ("OLB", "OLB"),
+        ("CB", "CB"),
+        ("DB", "DB"),
+        ("FS", "FS"),
+        ("SS", "SS"),
+        ("S", "S"),
+        ("K", "K"),
+        ("PK", "K"),
+        ("P", "P"),
+        ("LS", "LS"),
+        ("ATH", "ATH"),
+    ]
+
+    @staticmethod
+    def is_likely_name(value):
+
+        value = clean_text(value)
+
+        if not value:
+            return False
+
+        if value.casefold() in PatternExtractor.NAME_BLACKLIST:
+            return False
+
+        if len(value) > 65:
+            return False
+
+        if re.search(r"\d", value):
+            return False
+
+        words = value.split()
+
+        if len(words) < 2 or len(words) > 5:
+            return False
+
+        # Names should primarily contain alphabetic characters.
+        for word in words:
+            if not re.fullmatch(
+                r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'’\-]*",
+                word
+            ):
+                return False
+
+        return True
+
+    @classmethod
+    def is_name_anchor(cls, anchor):
+
+        name = clean_text(
+            anchor.get_text(" ", strip=True)
+        )
+
+        if not cls.is_likely_name(name):
+            return False
+
+        href = str(anchor.get("href", "")).lower()
+
+        classes = " ".join(
+            anchor.get("class", [])
+        ).lower()
+
+        parent = anchor.parent
+
+        inside_heading = False
+
+        while parent is not None and getattr(parent, "name", None):
+            if parent.name in ("h2", "h3", "h4"):
+                inside_heading = True
+                break
+
+            if parent.name in ("body", "html"):
+                break
+
+            parent = parent.parent
+
+        recognizable_link = any(
+            marker in href
+            for marker in (
+                "roster",
+                "player",
+                "athlete",
+                "bio",
+            )
+        )
+
+        recognizable_class = (
+            "player" in classes
+            or "roster" in classes
+        )
+
+        return (
+            recognizable_link
+            or recognizable_class
+            or inside_heading
+        )
+
+    @staticmethod
+    def has_player_details(text):
+
+        text = clean_text(text)
+
+        height = re.search(
+            r"\b[4-7]\s*['′’]\s*\d{1,2}\s*[\"″”]?",
+            text
+        )
+
+        weight = re.search(
+            r"\b\d{2,3}\s*(?:lbs?\.?|pounds?)\b",
+            text,
+            re.IGNORECASE
+        )
+
+        class_year = any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in PatternExtractor.CLASS_PATTERNS
+        )
+
+        position = PatternExtractor.find_position(text)
+
+        return bool(
+            height
+            or weight
+            or class_year
+            or position
+        )
+
+    @classmethod
+    def find_record_container(cls, anchor):
+
+        name = clean_text(
+            anchor.get_text(" ", strip=True)
+        )
+
+        for parent in anchor.parents:
+
+            if not getattr(parent, "name", None):
+                continue
+
+            if parent.name in (
+                "body",
+                "html",
+                "main",
+            ):
+                break
+
+            text = clean_text(
+                parent.get_text(" ", strip=True)
+            )
+
+            if len(text) > 600:
+                continue
+
+            if len(text) <= len(name) + 3:
+                continue
+
+            if name.casefold() not in text.casefold():
+                continue
+
+            if not cls.has_player_details(text):
+                continue
+
+            name_links = [
+                link
+                for link in parent.find_all("a")
+                if cls.is_name_anchor(link)
+            ]
+
+            # A player record should normally contain one
+            # recognizable player-name link.
+            if len(name_links) == 1:
+                return parent
+
+        return None
+
+    @staticmethod
+    def find_height(text):
+
+        match = re.search(
+            r"\b([4-7])\s*['′’]\s*(\d{1,2})\s*[\"″”]?",
+            text
+        )
+
+        if not match:
+            return ""
+
+        return f"{match.group(1)}'{match.group(2)}\""
+
+    @staticmethod
+    def find_weight(text):
+
+        match = re.search(
+            r"\b(\d{2,3})\s*(?:lbs?\.?|pounds?)\b",
+            text,
+            re.IGNORECASE
+        )
+
+        if not match:
+            return ""
+
+        return f"{match.group(1)} lbs"
+
+    @staticmethod
+    def find_class_year(text):
+
+        for pattern in PatternExtractor.CLASS_PATTERNS:
+
+            match = re.search(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
+
+            if match:
+                return clean_text(match.group(0))
+
+        return ""
+
+    @staticmethod
+    def find_position(text):
+
+        text_upper = clean_text(text).upper()
+
+        for label, position in PatternExtractor.POSITION_PATTERNS:
+
+            pattern = (
+                r"(?<![A-Z])"
+                + re.escape(label)
+                + r"(?![A-Z])"
+            )
+
+            if re.search(pattern, text_upper):
+                return position
+
+        return ""
+
+    @staticmethod
+    def find_jersey_number(record, name):
+
+        strings = [
+            clean_text(value)
+            for value in record.find_all(string=True)
+        ]
+
+        name_index = None
+
+        for index, value in enumerate(strings):
+
+            if name.casefold() in value.casefold():
+                name_index = index
+                break
+
+        if name_index is None:
+            return ""
+
+        # Look backward from the player name for a standalone
+        # jersey number.
+        for value in reversed(
+            strings[max(0, name_index - 4):name_index]
+        ):
+
+            match = re.fullmatch(
+                r"#?\s*(\d{1,2})",
+                value
+            )
+
+            if match:
+                return match.group(1)
+
+        return ""
+
+    @staticmethod
+    def find_labeled_fields(record):
+
+        player = empty_player()
+
+        # Reuse the existing card-field reader where possible.
+        for field, keywords in CardExtractor.FIELD_KEYWORDS.items():
+
+            try:
+                value = CardExtractor.find_field(
+                    record,
+                    keywords
+                )
+
+                if value:
+                    player[field] = value
+
+            except Exception:
+                continue
+
+        # Read definition-list fields.
+        for dt in record.find_all("dt"):
+
+            label = clean_text(
+                dt.get_text(" ", strip=True)
+            )
+
+            dd = dt.find_next_sibling("dd")
+
+            if not dd:
+                continue
+
+            normalized = normalize_header(label)
+
+            for field, aliases in HEADER_ALIASES.items():
+
+                if normalized in aliases:
+                    player[field] = clean_text(
+                        dd.get_text(" ", strip=True)
+                    )
+
+        return player
+
+    @classmethod
+    def extract_player(cls, anchor, record):
+
+        name = clean_text(
+            anchor.get_text(" ", strip=True)
+        )
+
+        text = clean_text(
+            record.get_text(" ", strip=True)
+        )
+
+        player = cls.find_labeled_fields(record)
+
+        player["name"] = name
+
+        if not player.get("jersey_number"):
+            player["jersey_number"] = (
+                cls.find_jersey_number(record, name)
+            )
+
+        if not player.get("height"):
+            player["height"] = cls.find_height(text)
+
+        if not player.get("weight"):
+            player["weight"] = cls.find_weight(text)
+
+        if not player.get("class_year"):
+            player["class_year"] = cls.find_class_year(text)
+
+        if not player.get("position"):
+            player["position"] = cls.find_position(text)
+
+        profile_url = clean_text(
+            anchor.get("href", "")
+        )
+
+        # Preserve the complete original text so information
+        # that cannot yet be mapped is not discarded.
+        player["raw_fields"] = {
+            "Roster Details": text,
+            "Profile URL": profile_url,
+        }
+
+        player["custom_fields"] = {
+            "Roster Details": text,
+        }
+
+        player["source_headers"] = [
+            "Roster Details",
+            "Profile URL",
+        ]
+
+        player["raw_source_row"] = [
+            text,
+            profile_url,
+        ]
+
+        complete_player(player)
+
+        return player
+
+    @classmethod
+    def extract(cls, soup):
+
+        anchors = [
+            anchor
+            for anchor in soup.find_all("a", href=True)
+            if cls.is_name_anchor(anchor)
+        ]
+
+        players = []
+        seen = set()
+
+        for anchor in anchors:
+
+            name = clean_text(
+                anchor.get_text(" ", strip=True)
+            )
+
+            record = cls.find_record_container(anchor)
+
+            if record is None:
+                continue
+
+            player = cls.extract_player(
+                anchor,
+                record
+            )
+
+            if not player["name"]:
+                continue
+
+            identity = (
+                player["name"].casefold(),
+                player.get("jersey_number", ""),
+                player.get("position", ""),
+            )
+
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            players.append(player)
+
+        return TableExtractor.remove_duplicates(players)
+
+
+
+
+
+
 
 # ============================================================
 # NORMALIZATION AND VALIDATION
@@ -960,36 +1447,43 @@ class PlayerValidator:
 # MAIN EXTRACTION ENGINE
 # ============================================================
 
+
 class RosterEngine:
 
     @staticmethod
     def build_url_variants(url):
+
         variants = [url]
 
         parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
+        query = parse_qs(parsed.query)
 
-        if "lsusports.net" in hostname:
-            query = parse_qs(parsed.query)
+        current_view = query.get("view", [""])[0].lower()
 
-            if query.get("view", [""])[0].lower() != "table":
-                query["view"] = ["table"]
+        # Many athletics websites support multiple roster views.
+        # Try the table version as a fallback without requiring
+        # a school-specific rule.
+        if current_view != "table":
 
-                table_url = urlunparse((
-                    parsed.scheme,
-                    parsed.netloc,
-                    parsed.path,
-                    parsed.params,
-                    urlencode(query, doseq=True),
-                    parsed.fragment,
-                ))
+            query["view"] = ["table"]
 
+            table_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                urlencode(query, doseq=True),
+                parsed.fragment,
+            ))
+
+            if table_url not in variants:
                 variants.append(table_url)
 
         return variants
 
     @staticmethod
     def score_candidate(candidate):
+
         players = candidate.get("players", [])
 
         if not players:
@@ -998,6 +1492,7 @@ class RosterEngine:
         populated = 0
 
         for player in players:
+
             populated += sum(
                 bool(clean_text(player.get(field, "")))
                 for field in PLAYER_FIELDS
@@ -1013,6 +1508,7 @@ class RosterEngine:
             "HTML Table": 5,
             "Roster Cards": 3,
             "Structured JSON-LD": 0,
+            "Pattern-Based Roster": 2,
         }.get(candidate.get("method"), 0)
 
         return (
@@ -1023,62 +1519,86 @@ class RosterEngine:
 
     @staticmethod
     def collect_candidates(soup):
+
         candidates = []
 
-        try:
-            candidates.extend(
-                TableExtractor.extract_candidates(soup)
-            )
-        except Exception:
-            pass
+        strategies = [
+            (
+                "HTML Table",
+                TableExtractor.extract_candidates,
+            ),
+            (
+                "Roster Cards",
+                CardExtractor.extract,
+            ),
+            (
+                "Structured JSON-LD",
+                StructuredDataExtractor.extract,
+            ),
+            (
+                "Pattern-Based Roster",
+                PatternExtractor.extract,
+            ),
+        ]
 
-        try:
-            players = CardExtractor.extract(soup)
+        for method, extractor in strategies:
 
-            if players:
-                candidates.append({
-                    "method": "Roster Cards",
-                    "players": players,
-                })
-        except Exception:
-            pass
+            try:
 
-        try:
-            players = StructuredDataExtractor.extract(soup)
+                result = extractor(soup)
 
-            if players:
-                candidates.append({
-                    "method": "Structured JSON-LD",
-                    "players": players,
-                })
-        except Exception:
-            pass
+                # TableExtractor already returns candidate dictionaries.
+                if method == "HTML Table":
+
+                    candidates.extend(result)
+                    continue
+
+                if result:
+
+                    candidates.append({
+                        "method": method,
+                        "players": result,
+                    })
+
+            except Exception:
+                # One strategy failing must not prevent the
+                # remaining strategies from being evaluated.
+                continue
 
         for candidate in candidates:
-            candidate["players"] = TableExtractor.remove_duplicates(
-                candidate["players"]
+
+            candidate["players"] = (
+                TableExtractor.remove_duplicates(
+                    candidate["players"]
+                )
             )
 
-            candidate["score"] = RosterEngine.score_candidate(
-                candidate
+            candidate["score"] = (
+                RosterEngine.score_candidate(candidate)
             )
 
         return candidates
 
     @staticmethod
     def extract(url, school="", season=""):
+
         original_url = url.strip()
 
-        if not original_url.startswith(("http://", "https://")):
+        if not original_url.startswith(
+            ("http://", "https://")
+        ):
             original_url = "https://" + original_url
 
         page_results = []
         errors = []
 
+        # Retrieve all available URL variants.
         for candidate_url in RosterEngine.build_url_variants(
             original_url
         ):
+
             try:
+
                 soup, final_url, retrieval_method = (
                     WebsiteRetriever.retrieve(
                         candidate_url,
@@ -1093,6 +1613,7 @@ class RosterEngine:
                 })
 
             except Exception as error:
+
                 errors.append(
                     f"{candidate_url}: {error}"
                 )
@@ -1100,54 +1621,75 @@ class RosterEngine:
         best_candidate = None
         best_page = None
 
+        # Evaluate every extraction strategy on every retrieved page.
         for page in page_results:
+
             candidates = RosterEngine.collect_candidates(
                 page["soup"]
             )
 
             for candidate in candidates:
+
                 if (
                     best_candidate is None
                     or candidate["score"] > best_candidate["score"]
                 ):
+
                     best_candidate = candidate
                     best_page = page
 
-        # JavaScript fallback if ordinary retrieval did not find
-        # a recognizable roster.
+        # Browser fallback if ordinary retrieval could not
+        # identify any roster records.
         if best_candidate is None:
-            try:
-                soup, final_url, retrieval_method = (
-                    WebsiteRetriever.retrieve_browser(
-                        original_url
-                    )
-                )
 
-                page = {
-                    "soup": soup,
-                    "final_url": final_url,
-                    "retrieval_method": retrieval_method,
-                }
+            for candidate_url in RosterEngine.build_url_variants(
+                original_url
+            ):
 
-                candidates = RosterEngine.collect_candidates(soup)
+                try:
 
-                if candidates:
-                    best_candidate = max(
-                        candidates,
-                        key=lambda item: item["score"]
+                    soup, final_url, retrieval_method = (
+                        WebsiteRetriever.retrieve_browser(
+                            candidate_url
+                        )
                     )
 
-                    best_page = page
+                    page = {
+                        "soup": soup,
+                        "final_url": final_url,
+                        "retrieval_method": retrieval_method,
+                    }
 
-            except Exception as error:
-                errors.append(
-                    f"Browser fallback: {error}"
-                )
+                    candidates = RosterEngine.collect_candidates(
+                        soup
+                    )
+
+                    if candidates:
+
+                        candidate = max(
+                            candidates,
+                            key=lambda item: item["score"]
+                        )
+
+                        if (
+                            best_candidate is None
+                            or candidate["score"] > best_candidate["score"]
+                        ):
+
+                            best_candidate = candidate
+                            best_page = page
+
+                except Exception as error:
+
+                    errors.append(
+                        f"Browser fallback ({candidate_url}): {error}"
+                    )
 
         if best_candidate is None:
+
             message = (
                 "No recognizable roster structure was found. "
-                "The website may require a site-specific extraction adapter."
+                "All available extraction strategies were attempted."
             )
 
             if errors:
@@ -1161,6 +1703,7 @@ class RosterEngine:
         title = ""
 
         if soup.title:
+
             title = clean_text(
                 soup.title.get_text()
             )
@@ -1180,20 +1723,21 @@ class RosterEngine:
         )
 
         for player in players:
+
             complete_player(player)
 
             player["school"] = detected_school
             player["season"] = detected_season
 
-            # Keep both the original submitted URL and the actual
-            # page variant used for extraction.
             player["source_url"] = original_url
             player["retrieved_url"] = final_url
 
             player["source_title"] = title
+
             player["retrieval_method"] = (
                 best_page["retrieval_method"]
             )
+
             player["extraction_method"] = (
                 best_candidate["method"]
             )
