@@ -768,14 +768,51 @@ class CardExtractor:
 
         return ""
 
-    @staticmethod
-    def find_field(card, keywords):
-        for element in card.find_all(True):
-            classes = element.get("class", [])
-            class_text = " ".join(classes).lower()
+    @classmethod
+    def find_field(cls, card, keywords):
+        normalized_keywords = {
+            normalize_header(keyword)
+            for keyword in keywords
+        }
 
-            for keyword in keywords:
-                if keyword in class_text:
+        # Match exact class tokens, suffixes, and longer semantic
+        # class names such as sidearm-roster-player-position.
+        for element in card.find_all(True):
+            class_tokens = cls._normalized_class_tokens(element)
+
+            matched = any(
+                token == keyword
+                or token.endswith(keyword)
+                or (
+                    len(keyword) >= 7
+                    and keyword in token
+                )
+                for token in class_tokens
+                for keyword in normalized_keywords
+            )
+
+            if not matched:
+                continue
+
+            value = clean_text(
+                element.get_text(" ", strip=True)
+            )
+
+            if value:
+                return value
+
+        # Check semantic HTML attributes.
+        for element in card.find_all(True):
+            labels = [
+                element.get("data-label", ""),
+                element.get("aria-label", ""),
+                element.get("title", ""),
+            ]
+
+            for label in labels:
+                normalized_label = normalize_header(label)
+
+                if normalized_label in normalized_keywords:
                     value = clean_text(
                         element.get_text(" ", strip=True)
                     )
@@ -783,24 +820,47 @@ class CardExtractor:
                     if value:
                         return value
 
+        # Definition-list format: <dt>Position</dt><dd>Linebacker</dd>
         for dt in card.find_all("dt"):
             label = normalize_header(
                 dt.get_text(" ", strip=True)
             )
 
-            dd = dt.find_next_sibling("dd")
-
-            if not dd:
+            if label not in normalized_keywords:
                 continue
 
-            for keyword in keywords:
-                if normalize_header(keyword) in label:
-                    return clean_text(
-                        dd.get_text(" ", strip=True)
-                    )
+            dd = dt.find_next_sibling("dd")
+
+            if dd:
+                value = clean_text(
+                    dd.get_text(" ", strip=True)
+                )
+
+                if value:
+                    return value
+
+        # Common label/value sibling format.
+        for element in card.find_all(True):
+            label = normalize_header(
+                element.get_text(" ", strip=True)
+            )
+
+            if label not in normalized_keywords:
+                continue
+
+            sibling = element.find_next_sibling()
+
+            if sibling:
+                value = clean_text(
+                    sibling.get_text(" ", strip=True)
+                )
+
+                if value and value != label:
+                    return value
 
         return ""
 
+    
     @classmethod
     def extract(cls, soup):
         matched_cards = []
@@ -952,14 +1012,17 @@ class StructuredDataExtractor:
     
 
 
+
 class PatternExtractor:
 
     """
-    General fallback extractor for roster pages that do not use
-    recognizable HTML tables or standard player-card classes.
+    General fallback extractor for roster pages.
 
-    Uses player-name links, surrounding record structure, explicit
-    field labels, HTML attributes, and text patterns.
+    Uses player-name links, surrounding record structure,
+    explicit field labels, HTML attributes, and text patterns.
+
+    Designed to preserve unfamiliar values instead of requiring
+    every school to use the same position or class-year vocabulary.
     """
 
     NAME_BLACKLIST = {
@@ -976,17 +1039,21 @@ class PatternExtractor:
         "statistics",
     }
 
+    # Recognize both full and abbreviated academic classifications.
     CLASS_PATTERNS = [
         r"\bredshirt\s+(?:freshman|sophomore|junior|senior)\b",
         r"\b(?:freshman|sophomore|junior|senior)\b",
         r"\b(?:fifth|sixth|seventh|eighth)\s+year\b",
         r"\bgraduate\s+student\b",
         r"\b(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s+year\b",
+        r"\bR[- ]?(?:Fr|So|Jr|Sr)\.?\b",
+        r"\b(?:Fr|So|Jr|Sr)\.?\b",
+        r"\b(?:5th|6th|7th|8th)\b",
+        r"\bGr\.?\b",
     ]
 
-    # Longer position names and abbreviations come first.
-    # Single-letter positions are handled separately to reduce
-    # accidental matches in ordinary roster text.
+    # These are recognized position labels, not an exhaustive
+    # list. Explicitly labeled unfamiliar values are preserved.
     POSITION_PATTERNS = [
         ("OFFENSIVE LINE", "OL"),
         ("DEFENSIVE LINE", "DL"),
@@ -1003,15 +1070,7 @@ class PatternExtractor:
         ("DEFENSIVE TACKLE", "DT"),
         ("LONG SNAPPER", "LS"),
         ("PLACE KICKER", "PK"),
-        ("PUNTER", "P"),
-        ("KICKER", "K"),
         ("FULLBACK", "FB"),
-        ("SAFETY", "S"),
-        ("EDGE", "EDGE"),
-        ("NICKEL", "NB"),
-        ("ROVER", "ROVER"),
-        ("BANDIT", "BANDIT"),
-        ("JACK", "JACK"),
         ("ATHLETE", "ATH"),
         ("QB", "QB"),
         ("RB", "RB"),
@@ -1041,21 +1100,52 @@ class PatternExtractor:
         ("NB", "NB"),
         ("LS", "LS"),
         ("PK", "PK"),
-        ("ATH", "ATH"),
         ("PR", "PR"),
         ("KR", "KR"),
         ("SAF", "S"),
+        ("JACK", "JACK"),
+        ("STAR", "STAR"),
+        ("HOR", "HOR"),
+        ("ST", "ST"),
+        ("ROVER", "ROVER"),
+        ("BANDIT", "BANDIT"),
+        ("NICKEL", "NB"),
+        ("PUNTER", "P"),
+        ("KICKER", "K"),
+        ("SAFETY", "S"),
     ]
 
     POSITION_LABEL_PATTERN = re.compile(
-        r"\b(?:position|pos)\s*[:\-]\s*"
-        r"([A-Za-z][A-Za-z /&-]{0,30})",
+        r"\b(?:position|pos)\s*[:\-]?\s*",
         re.IGNORECASE
     )
 
     JERSEY_LABEL_PATTERN = re.compile(
         r"\b(?:jersey|uniform|player)\s*"
         r"(?:number|no\.?|#)\s*[:#\-]?\s*(\d{1,2})\b",
+        re.IGNORECASE
+    )
+
+    FIELD_LABELS = {
+        "position": r"(?:position|pos)",
+        "class_year": (
+            r"(?:academic\s*year|class\s*year|class|eligibility)"
+        ),
+        "height": r"(?:height|ht)",
+        "weight": r"(?:weight|wt)",
+        "hometown": r"(?:hometown|home)",
+        "high_school": r"(?:high\s*school|prep\s*school)",
+        "previous_school": r"(?:previous\s*school|prev\s*school)",
+        "experience": r"(?:experience|seasons\s*played)",
+    }
+
+    # Boundaries used to identify where a labeled value ends.
+    FIELD_BOUNDARY_PATTERN = re.compile(
+        r"\b(?:"
+        + "|".join(
+            FIELD_LABELS.values()
+        )
+        + r")\b",
         re.IGNORECASE
     )
 
@@ -1070,10 +1160,7 @@ class PatternExtractor:
         if value.casefold() in PatternExtractor.NAME_BLACKLIST:
             return False
 
-        if len(value) > 65:
-            return False
-
-        if re.search(r"\d", value):
+        if len(value) > 65 or re.search(r"\d", value):
             return False
 
         words = value.split()
@@ -1148,35 +1235,22 @@ class PatternExtractor:
 
         text = clean_text(text)
 
-        height = re.search(
-            r"\b[4-7]\s*['′’]\s*\d{1,2}\s*[\"″”]?",
-            text
-        )
+        checks = [
+            re.search(
+                r"\b[4-7]\s*['′’]\s*\d{1,2}\s*[\"″”]?",
+                text
+            ),
+            re.search(
+                r"\b\d{2,3}\s*(?:lbs?\.?|pounds?)\b",
+                text,
+                re.IGNORECASE
+            ),
+            PatternExtractor.find_class_year(text),
+            PatternExtractor.find_position(text),
+            PatternExtractor.JERSEY_LABEL_PATTERN.search(text),
+        ]
 
-        weight = re.search(
-            r"\b\d{2,3}\s*(?:lbs?\.?|pounds?)\b",
-            text,
-            re.IGNORECASE
-        )
-
-        class_year = any(
-            re.search(pattern, text, re.IGNORECASE)
-            for pattern in PatternExtractor.CLASS_PATTERNS
-        )
-
-        position = PatternExtractor.find_position(text)
-
-        jersey = PatternExtractor.JERSEY_LABEL_PATTERN.search(
-            text
-        )
-
-        return bool(
-            height
-            or weight
-            or class_year
-            or position
-            or jersey
-        )
+        return any(checks)
 
     @classmethod
     def find_record_container(cls, anchor):
@@ -1201,7 +1275,7 @@ class PatternExtractor:
                 parent.get_text(" ", strip=True)
             )
 
-            if len(text) > 600:
+            if len(text) > 900:
                 continue
 
             if len(text) <= len(name) + 3:
@@ -1254,6 +1328,8 @@ class PatternExtractor:
     @staticmethod
     def find_class_year(text):
 
+        text = clean_text(text)
+
         for pattern in PatternExtractor.CLASS_PATTERNS:
 
             match = re.search(
@@ -1268,6 +1344,50 @@ class PatternExtractor:
         return ""
 
     @classmethod
+    def extract_labeled_value(cls, text, field):
+
+        text = clean_text(text)
+
+        label_pattern = cls.FIELD_LABELS.get(field)
+
+        if not text or not label_pattern:
+            return ""
+
+        match = re.search(
+            r"\b" + label_pattern + r"\b\s*[:\-]?\s*",
+            text,
+            re.IGNORECASE
+        )
+
+        if not match:
+            return ""
+
+        start = match.end()
+
+        next_field = cls.FIELD_BOUNDARY_PATTERN.search(
+            text,
+            start
+        )
+
+        end = (
+            next_field.start()
+            if next_field
+            else len(text)
+        )
+
+        value = clean_text(
+            text[start:end]
+        )
+
+        value = re.sub(
+            r"^[\s:;,\-|]+|[\s:;,\-|]+$",
+            "",
+            value
+        )
+
+        return value
+
+    @classmethod
     def find_position(cls, text):
 
         text = clean_text(text)
@@ -1275,31 +1395,40 @@ class PatternExtractor:
         if not text:
             return ""
 
-        # First look for an explicitly labeled position.
-        labeled_match = cls.POSITION_LABEL_PATTERN.search(text)
+        # First use the explicitly labeled position value.
+        labeled = cls.extract_labeled_value(
+            text,
+            "position"
+        )
 
-        if labeled_match:
+        if labeled:
 
-            labeled_value = clean_text(
-                labeled_match.group(1)
-            ).upper()
+            # Remove unrelated metadata that may follow the position.
+            labeled = re.split(
+                r"\b(?:academic\s*year|class\s*year|class|"
+                r"height|ht|weight|wt|hometown|experience)\b",
+                labeled,
+                maxsplit=1,
+                flags=re.IGNORECASE
+            )[0]
 
-            labeled_value = re.split(
-                r"[,;|]",
-                labeled_value
-            )[0].strip()
+            labeled = clean_text(
+                labeled.strip(" :;,-|")
+            )
 
-            if labeled_value:
-                return labeled_value
+            # Keep a reasonable labeled value, including unfamiliar
+            # football position names and combined position groups.
+            if (
+                labeled
+                and len(labeled) <= 35
+                and not re.search(r"\d", labeled)
+            ):
+                return labeled.upper()
 
+        # Fallback to recognized positions in unlabeled text.
         text_upper = text.upper()
 
-        # Match multi-character position labels using word
-        # boundaries so that "DE" does not match inside a word.
         for label, position in cls.POSITION_PATTERNS:
-
-            if len(label) < 2:
-                continue
 
             pattern = (
                 r"(?<![A-Z])"
@@ -1309,19 +1438,6 @@ class PatternExtractor:
 
             if re.search(pattern, text_upper):
                 return position
-
-        # Single-letter positions are only accepted when the
-        # entire value is a single position or a clearly labeled
-        # position. This avoids matching random letters in text.
-        single_letter_positions = {
-            "C": "C",
-            "S": "S",
-            "K": "K",
-            "P": "P",
-        }
-
-        if text_upper in single_letter_positions:
-            return single_letter_positions[text_upper]
 
         return ""
 
@@ -1356,11 +1472,11 @@ class PatternExtractor:
     @classmethod
     def find_jersey_number(cls, record, name):
 
-        # 1. Search the complete record text for an explicit label.
         record_text = clean_text(
             record.get_text(" ", strip=True)
         )
 
+        # Explicit text label.
         labeled_match = cls.JERSEY_LABEL_PATTERN.search(
             record_text
         )
@@ -1368,8 +1484,7 @@ class PatternExtractor:
         if labeled_match:
             return labeled_match.group(1)
 
-        # 2. Inspect HTML elements and their attributes.
-        # This catches accessible labels and data attributes.
+        # Search element attributes and accessible labels.
         for element in record.find_all(True):
 
             attributes = []
@@ -1395,7 +1510,6 @@ class PatternExtractor:
             ):
                 continue
 
-            # Check the attributes themselves first.
             number = cls.extract_number_from_value(
                 attribute_text
             )
@@ -1403,7 +1517,6 @@ class PatternExtractor:
             if number:
                 return number
 
-            # Then check the element's visible text.
             number = cls.extract_number_from_value(
                 element.get_text(" ", strip=True)
             )
@@ -1411,9 +1524,9 @@ class PatternExtractor:
             if number:
                 return number
 
-        # 3. Check common explicit labels in definition lists.
+        # Explicit labels in definition lists or neighboring elements.
         for label in record.find_all(
-            ["dt", "th", "label", "span", "div"]
+            ["dt", "th", "label", "span", "div", "a"]
         ):
 
             label_text = clean_text(
@@ -1434,6 +1547,7 @@ class PatternExtractor:
             )
 
             if value_element:
+
                 number = cls.extract_number_from_value(
                     value_element.get_text(" ", strip=True)
                 )
@@ -1441,7 +1555,7 @@ class PatternExtractor:
                 if number:
                     return number
 
-        # 4. Preserve the original nearby-number fallback.
+        # Nearby standalone numbers, checking both directions.
         strings = [
             clean_text(value)
             for value in record.find_all(string=True)
@@ -1457,9 +1571,12 @@ class PatternExtractor:
 
         if name_index is not None:
 
-            for value in reversed(
-                strings[max(0, name_index - 4):name_index]
-            ):
+            nearby = (
+                strings[max(0, name_index - 5):name_index]
+                + strings[name_index + 1:name_index + 4]
+            )
+
+            for value in nearby:
 
                 match = re.fullmatch(
                     r"#?\s*(\d{1,2})",
@@ -1476,7 +1593,6 @@ class PatternExtractor:
 
         player = empty_player()
 
-        # Reuse the existing card-field reader.
         for field, keywords in CardExtractor.FIELD_KEYWORDS.items():
 
             try:
@@ -1492,7 +1608,7 @@ class PatternExtractor:
             except Exception:
                 continue
 
-        # Read definition-list fields.
+        # Definition-list fields.
         for dt in record.find_all("dt"):
 
             label = clean_text(
@@ -1509,12 +1625,12 @@ class PatternExtractor:
             for field, aliases in HEADER_ALIASES.items():
 
                 if normalized in aliases:
+
                     player[field] = clean_text(
                         dd.get_text(" ", strip=True)
                     )
 
-        # Read explicitly labeled fields using common HTML
-        # attributes such as data-label, aria-label and title.
+        # Attribute-based labels.
         for element in record.find_all(True):
 
             label_parts = []
@@ -1569,6 +1685,30 @@ class PatternExtractor:
 
         player["name"] = name
 
+        # Read fields from combined text when structured labels
+        # or card extractors did not identify them.
+        for field in (
+            "position",
+            "class_year",
+            "height",
+            "weight",
+            "hometown",
+            "high_school",
+            "previous_school",
+            "experience",
+        ):
+
+            if player.get(field):
+                continue
+
+            value = cls.extract_labeled_value(
+                text,
+                field
+            )
+
+            if value:
+                player[field] = value
+
         if not player.get("jersey_number"):
             player["jersey_number"] = (
                 cls.find_jersey_number(record, name)
@@ -1590,8 +1730,6 @@ class PatternExtractor:
             anchor.get("href", "")
         )
 
-        # Preserve original information even when a field
-        # cannot confidently be identified.
         player["raw_fields"] = {
             "Roster Details": text,
             "Profile URL": profile_url,
@@ -1611,23 +1749,20 @@ class PatternExtractor:
             profile_url,
         ]
 
-        complete_player(player)
-
-        return player
+        return complete_player(player)
 
     @classmethod
     def extract(cls, soup):
 
-        anchors = [
-            anchor
-            for anchor in soup.find_all("a", href=True)
-            if cls.is_name_anchor(anchor)
-        ]
-
         players = []
         seen = set()
 
+        anchors = soup.find_all("a")
+
         for anchor in anchors:
+
+            if not cls.is_name_anchor(anchor):
+                continue
 
             name = clean_text(
                 anchor.get_text(" ", strip=True)
@@ -1635,7 +1770,7 @@ class PatternExtractor:
 
             record = cls.find_record_container(anchor)
 
-            if record is None:
+            if not record:
                 continue
 
             player = cls.extract_player(
@@ -1643,22 +1778,24 @@ class PatternExtractor:
                 record
             )
 
-            if not player["name"]:
-                continue
-
-            identity = (
-                player["name"].casefold(),
+            key = (
+                name.casefold(),
                 player.get("jersey_number", ""),
-                player.get("position", ""),
+                player.get("raw_fields", {}).get(
+                    "Profile URL", ""
+                ),
             )
 
-            if identity in seen:
+            if key in seen:
                 continue
 
-            seen.add(identity)
+            seen.add(key)
+
             players.append(player)
 
-        return TableExtractor.remove_duplicates(players)
+        return players
+
+
 
 
 
@@ -1669,62 +1806,815 @@ class PatternExtractor:
 # NORMALIZATION AND VALIDATION
 # ============================================================
 
+
+# ============================================================
+# NORMALIZATION, VALIDATION, AND DUPLICATE REVIEW
+# ============================================================
+
 class PlayerValidator:
 
     @staticmethod
+    def _normalized(value):
+        return clean_text(value).casefold()
+
+    @staticmethod
+    def _identity_values(player):
+        return {
+            "name": PlayerValidator._normalized(
+                player.get("name", "")
+            ),
+            "number": PlayerValidator._normalized(
+                player.get("jersey_number", "")
+            ).lstrip("#"),
+            "position": PlayerValidator._normalized(
+                player.get("position", "")
+            ),
+            "height": PlayerValidator._normalized(
+                player.get("height", "")
+            ),
+            "weight": PlayerValidator._normalized(
+                player.get("weight", "")
+            ),
+            "class_year": PlayerValidator._normalized(
+                player.get("class_year", "")
+            ),
+            "hometown": PlayerValidator._normalized(
+                player.get("hometown", "")
+            ),
+        }
+
+    @staticmethod
+    def _duplicate_relationship(first, second):
+        """
+        Return a duplicate classification only when the records
+        have enough identifying information to justify a flag.
+
+        Same-name players with different jersey numbers are not
+        treated as duplicates.
+        """
+
+        a = PlayerValidator._identity_values(first)
+        b = PlayerValidator._identity_values(second)
+
+        if not a["name"] or a["name"] != b["name"]:
+            return None
+
+        if (
+            a["number"]
+            and b["number"]
+            and a["number"] != b["number"]
+        ):
+            return None
+
+        if (
+            a["position"]
+            and b["position"]
+            and a["position"] != b["position"]
+        ):
+            return None
+
+        if a["number"] and b["number"]:
+            if a["position"] and b["position"]:
+                if a["position"] == b["position"]:
+                    return (
+                        "Exact duplicate",
+                        "Same name, jersey number, and position."
+                    )
+
+            return (
+                "Likely duplicate",
+                "Same name and jersey number."
+            )
+
+        corroborating_matches = 0
+
+        for field in (
+            "position",
+            "height",
+            "weight",
+            "class_year",
+            "hometown",
+        ):
+            if a[field] and b[field] and a[field] == b[field]:
+                corroborating_matches += 1
+
+        if corroborating_matches >= 3:
+            return (
+                "Likely duplicate",
+                "Same name and at least three matching player details."
+            )
+
+        if corroborating_matches >= 2:
+            return (
+                "Possible duplicate",
+                "Same name and two matching player details."
+            )
+
+        return None
+
+    @staticmethod
+    def flag_duplicates(players):
+        """
+        Annotate duplicate records without removing or merging them.
+        """
+
+        for player in players:
+            player["duplicate_status"] = ""
+            player["duplicate_group"] = ""
+            player["duplicate_reason"] = ""
+
+        group_number = 0
+        assigned_groups = {}
+
+        for first_index in range(len(players)):
+            for second_index in range(
+                first_index + 1,
+                len(players)
+            ):
+                relationship = (
+                    PlayerValidator._duplicate_relationship(
+                        players[first_index],
+                        players[second_index]
+                    )
+                )
+
+                if not relationship:
+                    continue
+
+                status, reason = relationship
+
+                first_group = assigned_groups.get(first_index)
+                second_group = assigned_groups.get(second_index)
+
+                if first_group and second_group:
+                    group = first_group
+                    if first_group != second_group:
+                        # Consolidate group references.
+                        for index, value in list(
+                            assigned_groups.items()
+                        ):
+                            if value == second_group:
+                                assigned_groups[index] = first_group
+
+                elif first_group:
+                    group = first_group
+
+                elif second_group:
+                    group = second_group
+
+                else:
+                    group_number += 1
+                    group = f"DUP-{group_number:03d}"
+
+                assigned_groups[first_index] = group
+                assigned_groups[second_index] = group
+
+                for index in (first_index, second_index):
+                    existing = players[index].get(
+                        "duplicate_status", ""
+                    )
+
+                    priority = {
+                        "": 0,
+                        "Possible duplicate": 1,
+                        "Likely duplicate": 2,
+                        "Exact duplicate": 3,
+                    }
+
+                    if priority[status] > priority.get(existing, 0):
+                        players[index]["duplicate_status"] = status
+
+                    players[index]["duplicate_group"] = group
+
+                    existing_reason = players[index].get(
+                        "duplicate_reason", ""
+                    )
+
+                    if reason not in existing_reason:
+                        players[index]["duplicate_reason"] = (
+                            f"{existing_reason}; {reason}"
+                            if existing_reason
+                            else reason
+                        )
+
+        return players
+
+    @staticmethod
     def validate(players):
-        seen = set()
+        for player in players:
+            complete_player(player)
+
+            warnings = list(player.get("warnings") or [])
+
+            if isinstance(warnings, str):
+                warnings = [
+                    item.strip()
+                    for item in warnings.split(";")
+                    if item.strip()
+                ]
+
+            # Remove stale warnings that this validator owns.
+            owned_warnings = {
+                "Missing player name",
+                "Missing position",
+                "Missing jersey number",
+                "Missing class year",
+            }
+
+            warnings = [
+                warning
+                for warning in warnings
+                if warning not in owned_warnings
+            ]
+
+            if not clean_text(player.get("name", "")):
+                warnings.append("Missing player name")
+
+            if not clean_text(player.get("position", "")):
+                warnings.append("Missing position")
+
+            if not clean_text(player.get("jersey_number", "")):
+                warnings.append("Missing jersey number")
+
+            if not clean_text(player.get("class_year", "")):
+                warnings.append("Missing class year")
+
+            player["warnings"] = list(dict.fromkeys(warnings))
+
+        PlayerValidator.flag_duplicates(players)
+
+        return players
+
+
+# ============================================================
+# MAIN EXTRACTION ENGINE
+# ============================================================
+
+class RosterEngine:
+
+    @staticmethod
+    def build_url_variants(url):
+        variants = [url]
+
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+
+        current_view = query.get("view", [""])[0].lower()
+
+        if current_view != "table":
+            query["view"] = ["table"]
+
+            table_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                urlencode(query, doseq=True),
+                parsed.fragment,
+            ))
+
+            if table_url not in variants:
+                variants.append(table_url)
+
+        return variants
+
+    @staticmethod
+    def score_candidate(candidate):
+        players = candidate.get("players", [])
+
+        if not players:
+            return 0
+
+        populated = 0
+
+        for player in players:
+            populated += sum(
+                bool(clean_text(player.get(field, "")))
+                for field in PLAYER_FIELDS
+            )
+
+            populated += len(
+                player.get("custom_fields") or {}
+            )
+
+        average = populated / len(players)
+
+        method_bonus = {
+            "HTML Table": 5,
+            "Roster Cards": 3,
+            "Structured JSON-LD": 0,
+            "Pattern-Based Roster": 2,
+        }.get(candidate.get("method"), 0)
+
+        return (
+            len(players) * 100
+            + average * 10
+            + method_bonus
+        )
+
+    @staticmethod
+    def collect_candidates(soup):
+        """
+        Run every extraction strategy independently.
+
+        Errors from one strategy are retained for diagnostics,
+        rather than silently disappearing.
+        """
+
+        candidates = []
+        strategy_errors = []
+
+        strategies = [
+            ("HTML Table", TableExtractor.extract_candidates),
+            ("Roster Cards", CardExtractor.extract),
+            (
+                "Structured JSON-LD",
+                StructuredDataExtractor.extract
+            ),
+            ("Pattern-Based Roster", PatternExtractor.extract),
+        ]
+
+        for method, extractor in strategies:
+            try:
+                result = extractor(soup)
+
+                if method == "HTML Table":
+                    for candidate in result:
+                        candidate = dict(candidate)
+                        candidate["method"] = method
+                        candidates.append(candidate)
+
+                    continue
+
+                if result:
+                    candidates.append({
+                        "method": method,
+                        "players": result,
+                    })
+
+            except Exception as error:
+                strategy_errors.append(
+                    f"{method}: {type(error).__name__}: {error}"
+                )
+
+        for candidate_index, candidate in enumerate(candidates):
+            candidate["candidate_id"] = candidate_index
+
+            normalized_players = []
+
+            for player in candidate.get("players", []):
+                player = dict(player)
+                complete_player(player)
+
+                player.setdefault("raw_fields", {})
+                player.setdefault("custom_fields", {})
+                player.setdefault("source_headers", [])
+                player.setdefault("raw_source_row", [])
+
+                player["_candidate_id"] = candidate_index
+                player["_candidate_method"] = method = (
+                    candidate.get("method", "Unknown")
+                )
+
+                normalized_players.append(player)
+
+            candidate["players"] = normalized_players
+            candidate["score"] = RosterEngine.score_candidate(
+                candidate
+            )
+
+        return candidates, strategy_errors
+
+    @staticmethod
+    def _profile_key(player):
+        profile = clean_text(
+            player.get("profile_url", "")
+            or (player.get("raw_fields") or {}).get("Profile URL", "")
+        )
+
+        if not profile:
+            return ""
+
+        return profile.split("#", 1)[0].rstrip("/").casefold()
+
+    @staticmethod
+    def _can_merge(first, second):
+        """
+        Decide whether records from different extraction candidates
+        are likely the same player.
+
+        Records from the same candidate are never merged. This
+        preserves repeated rows for duplicate review.
+        """
+
+        if (
+            first.get("_candidate_id")
+            == second.get("_candidate_id")
+        ):
+            return False
+
+        first_profile = RosterEngine._profile_key(first)
+        second_profile = RosterEngine._profile_key(second)
+
+        if (
+            first_profile
+            and second_profile
+            and first_profile == second_profile
+        ):
+            return True
+
+        first_name = clean_text(
+            first.get("name", "")
+        ).casefold()
+
+        second_name = clean_text(
+            second.get("name", "")
+        ).casefold()
+
+        if not first_name or first_name != second_name:
+            return False
+
+        first_number = clean_text(
+            first.get("jersey_number", "")
+        ).lstrip("#").casefold()
+
+        second_number = clean_text(
+            second.get("jersey_number", "")
+        ).lstrip("#").casefold()
+
+        if (
+            first_number
+            and second_number
+            and first_number != second_number
+        ):
+            return False
+
+        first_position = clean_text(
+            first.get("position", "")
+        ).casefold()
+
+        second_position = clean_text(
+            second.get("position", "")
+        ).casefold()
+
+        if (
+            first_position
+            and second_position
+            and first_position != second_position
+        ):
+            return False
+
+        # A shared name and jersey number are strong evidence.
+        if first_number and second_number:
+            return True
+
+        # If jersey number is missing, require two other matching
+        # attributes before combining the records.
+        matches = 0
+
+        for field in (
+            "position",
+            "height",
+            "weight",
+            "class_year",
+            "hometown",
+        ):
+            first_value = clean_text(
+                first.get(field, "")
+            ).casefold()
+
+            second_value = clean_text(
+                second.get(field, "")
+            ).casefold()
+
+            if first_value and second_value:
+                if first_value == second_value:
+                    matches += 1
+
+        return matches >= 2
+
+    
+    @staticmethod
+    def _merge_player_data(primary, secondary):
+        """
+        Fill missing values while preserving conflicting source values.
+        Conflicts are stored inside raw_fields so the existing database
+        JSON storage can retain them.
+        """
+
+        raw_fields = primary.setdefault("raw_fields", {})
+        conflicts = raw_fields.setdefault("_field_conflicts", {})
+
+        for field in PLAYER_FIELDS:
+            first_value = clean_text(primary.get(field, ""))
+            second_value = clean_text(secondary.get(field, ""))
+
+            if not first_value and second_value:
+                primary[field] = secondary[field]
+
+            elif (
+                first_value
+                and second_value
+                and first_value.casefold() != second_value.casefold()
+            ):
+                alternatives = conflicts.setdefault(field, [])
+
+                conflict = {
+                    "existing_value": primary[field],
+                    "alternative_value": secondary[field],
+                    "existing_method": (
+                        primary.get("_candidate_method", "Unknown")
+                    ),
+                    "alternative_method": (
+                        secondary.get("_candidate_method", "Unknown")
+                    ),
+                }
+
+                if conflict not in alternatives:
+                    alternatives.append(conflict)
+
+        for container_name in ("raw_fields", "custom_fields"):
+            primary_container = primary.setdefault(
+                container_name, {}
+            )
+            secondary_container = (
+                secondary.get(container_name) or {}
+            )
+
+            for key, value in secondary_container.items():
+                if key not in primary_container:
+                    primary_container[key] = value
+
+        # Restore the conflict container in case the secondary record
+        # also contained raw fields.
+        primary.setdefault("raw_fields", {})[
+            "_field_conflicts"
+        ] = conflicts
+
+        for list_field in ("source_headers", "raw_source_row"):
+            existing = primary.setdefault(list_field, [])
+
+            for value in secondary.get(list_field, []) or []:
+                if value not in existing:
+                    existing.append(value)
+
+        methods = primary.setdefault("extraction_methods", [])
+        secondary_method = secondary.get(
+            "_candidate_method", "Unknown"
+        )
+
+        if secondary_method not in methods:
+            methods.append(secondary_method)
+
+        sources = primary.setdefault("source_candidates", [])
+
+        source_description = {
+            "method": secondary_method,
+            "candidate_id": secondary.get("_candidate_id"),
+            "page_index": secondary.get("_page_index"),
+        }
+
+        if source_description not in sources:
+            sources.append(source_description)
+
+        return primary
+
+
+    @staticmethod
+    def merge_candidates(candidates):
+        """
+        Merge cross-strategy observations of the same player.
+
+        Duplicate rows within a single extraction candidate remain
+        separate records and are flagged later.
+        """
+
+        merged = []
+
+        for candidate in candidates:
+            method = candidate.get("method", "Unknown")
+
+            for incoming in candidate.get("players", []):
+                incoming = dict(incoming)
+
+                incoming.setdefault(
+                    "extraction_methods", [method]
+                )
+
+                incoming.setdefault(
+                    "source_candidates",
+                    [{
+                        "method": method,
+                        "candidate_id": incoming.get(
+                            "_candidate_id"
+                        ),
+                    }]
+                )
+
+                match = None
+
+                for existing in merged:
+                    if RosterEngine._can_merge(
+                        existing,
+                        incoming
+                    ):
+                        match = existing
+                        break
+
+                if match is None:
+                    merged.append(incoming)
+                else:
+                    RosterEngine._merge_player_data(
+                        match,
+                        incoming
+                    )
+
+        return merged
+
+    
+    @staticmethod
+    def extract(url, school="", season=""):
+        original_url = clean_text(url)
+
+        if not original_url:
+            raise ValueError("A roster URL is required.")
+
+        if not original_url.startswith(("http://", "https://")):
+            original_url = "https://" + original_url
+
+        page_results = []
+        errors = []
+        strategy_errors = []
+
+        variants = RosterEngine.build_url_variants(original_url)
+
+        # Normal HTTP retrieval.
+        for candidate_url in variants:
+            try:
+                soup, final_url, retrieval_method = (
+                    WebsiteRetriever.retrieve(
+                        candidate_url,
+                        use_browser=False
+                    )
+                )
+
+                page_results.append({
+                    "soup": soup,
+                    "final_url": final_url,
+                    "retrieval_method": retrieval_method,
+                })
+
+            except Exception as error:
+                errors.append(
+                    f"{candidate_url}: "
+                    f"{type(error).__name__}: {error}"
+                )
+
+        all_candidates = []
+
+        def add_page_candidates(page, page_index):
+            candidates, page_errors = (
+                RosterEngine.collect_candidates(page["soup"])
+            )
+
+            strategy_errors.extend(
+                f"Page {page_index + 1} - {item}"
+                for item in page_errors
+            )
+
+            for candidate in candidates:
+                candidate = dict(candidate)
+
+                # Globally unique candidate IDs are essential:
+                # different pages and strategies must be distinguishable.
+                candidate_id = len(all_candidates)
+
+                candidate["candidate_id"] = candidate_id
+                candidate["page_index"] = page_index
+
+                for player in candidate.get("players", []):
+                    player["_candidate_id"] = candidate_id
+                    player["_candidate_method"] = candidate.get(
+                        "method", "Unknown"
+                    )
+                    player["_page_index"] = page_index
+
+                all_candidates.append(candidate)
+
+        for page_index, page in enumerate(page_results):
+            add_page_candidates(page, page_index)
+
+        # Use browser retrieval only when ordinary retrieval produced
+        # no usable candidates.
+        if not all_candidates:
+            for candidate_url in variants:
+                try:
+                    soup, final_url, retrieval_method = (
+                        WebsiteRetriever.retrieve_browser(
+                            candidate_url
+                        )
+                    )
+
+                    page = {
+                        "soup": soup,
+                        "final_url": final_url,
+                        "retrieval_method": retrieval_method,
+                    }
+
+                    page_index = len(page_results)
+
+                    candidates_before = len(all_candidates)
+                    add_page_candidates(page, page_index)
+
+                    if len(all_candidates) > candidates_before:
+                        page_results.append(page)
+
+                except Exception as error:
+                    errors.append(
+                        f"Browser fallback ({candidate_url}): "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+        if not all_candidates:
+            message = (
+                "No recognizable roster records were extracted. "
+                "The page may require JavaScript, use an unsupported "
+                "layout, or block automated retrieval."
+            )
+
+            if errors:
+                message += "\n\nRetrieval errors:\n" + "\n".join(errors)
+
+            if strategy_errors:
+                message += (
+                    "\n\nExtraction strategy errors:\n"
+                    + "\n".join(strategy_errors)
+                )
+
+            raise RuntimeError(message)
+
+        best_candidate = max(
+            all_candidates,
+            key=lambda item: item.get("score", 0)
+        )
+
+        best_page = page_results[
+            best_candidate.get("page_index", 0)
+        ]
+
+        soup = best_page["soup"]
+        final_url = best_page["final_url"]
+
+        title = (
+            clean_text(soup.title.get_text(" ", strip=True))
+            if soup.title
+            else ""
+        )
+
+        detected_school = (
+            clean_text(school)
+            or infer_school(soup, final_url)
+        )
+
+        detected_season = (
+            clean_text(season)
+            or infer_season(soup, final_url)
+        )
+
+        players = RosterEngine.merge_candidates(all_candidates)
 
         for player in players:
             complete_player(player)
 
-            warnings = []
+            player["school"] = detected_school
+            player["season"] = detected_season
+            player["source_url"] = original_url
+            player["retrieved_url"] = final_url
+            player["source_title"] = title
+            player["retrieval_method"] = (
+                best_page["retrieval_method"]
+            )
 
-            name = clean_text(
-                player.get("name", "")
-            ).casefold()
+            methods = player.get("extraction_methods") or []
 
-            number = clean_text(
-                player.get("jersey_number", "")
-            ).casefold()
+            player["extraction_method"] = (
+                ", ".join(methods) if methods else "Unknown"
+            )
 
-            position = clean_text(
-                player.get("position", "")
-            ).casefold()
+            player.setdefault("raw_fields", {})
+            player.setdefault("custom_fields", {})
+            player.setdefault("source_headers", [])
+            player.setdefault("raw_source_row", [])
 
-            if not name:
-                warnings.append("Missing player name")
-
-            # Only flag a duplicate when there is identifying
-            # information beyond the player's name.
-            if name and (number or position):
-                key = (
-                    name,
-                    number,
-                    position,
-                    clean_text(player.get("height", "")),
-                    clean_text(player.get("weight", "")),
+            if strategy_errors:
+                warnings = player.setdefault("warnings", [])
+                warnings.append(
+                    "One or more extraction strategies reported errors."
                 )
 
-                if key in seen:
-                    warnings.append(
-                        "Possible duplicate player record"
-                    )
+        return PlayerValidator.validate(players)
 
-                seen.add(key)
 
-            if not player.get("position"):
-                warnings.append("Missing position")
-
-            if not player.get("jersey_number"):
-                warnings.append("Missing jersey number")
-
-            if not player.get("class_year"):
-                warnings.append("Missing class year")
-
-            player["warnings"] = warnings
-
-        return players
 
 # ============================================================
 # MAIN EXTRACTION ENGINE
@@ -2416,13 +3306,19 @@ class RosterExtractorWindow(QMainWindow):
             f"{APP_NAME} {APP_VERSION}"
         )
 
-        self.resize(1450, 850)
+        self.resize(1550, 900)
 
         self.database = RosterDatabase()
 
         self.current_players = []
         self.result_fields = list(DISPLAY_FIELDS)
         self.worker = None
+
+        self.review_fields = [
+            "duplicate_status",
+            "duplicate_group",
+            "duplicate_reason",
+        ]
 
         self.tabs = QTabWidget()
 
@@ -2459,6 +3355,16 @@ class RosterExtractorWindow(QMainWindow):
 
         self.results_table.setAlternatingRowColors(True)
 
+        self.results_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+
+        self.results_table.setSelectionMode(
+            QTableWidget.SelectionMode.ExtendedSelection
+        )
+
+        self.results_table.setSortingEnabled(False)
+
         self.status_label = QLabel("Ready.")
 
         self.progress_bar = QProgressBar()
@@ -2490,12 +3396,28 @@ class RosterExtractorWindow(QMainWindow):
         self.csv_button = QPushButton("Export CSV")
         self.csv_button.clicked.connect(self.export_csv)
 
+        self.select_flagged_button = QPushButton(
+            "Select Flagged Duplicates"
+        )
+        self.select_flagged_button.clicked.connect(
+            self.select_flagged_duplicates
+        )
+
+        self.delete_selected_button = QPushButton(
+            "Delete Selected Rows"
+        )
+        self.delete_selected_button.clicked.connect(
+            self.delete_selected_rows
+        )
+
         self.clear_button = QPushButton("Clear Results")
         self.clear_button.clicked.connect(self.clear_results)
 
         actions.addWidget(self.save_button)
         actions.addWidget(self.json_button)
         actions.addWidget(self.csv_button)
+        actions.addWidget(self.select_flagged_button)
+        actions.addWidget(self.delete_selected_button)
         actions.addWidget(self.clear_button)
 
         layout.addLayout(actions)
@@ -2774,13 +3696,18 @@ class RosterExtractorWindow(QMainWindow):
         self.results_table.setSortingEnabled(False)
 
         fields = list(DISPLAY_FIELDS)
+        fields.extend(self.review_fields)
+
         custom_fields = []
 
         for player in players:
             for field_name in (
                 player.get("custom_fields") or {}
             ):
-                if field_name not in custom_fields:
+                if (
+                    field_name not in custom_fields
+                    and field_name not in fields
+                ):
                     custom_fields.append(field_name)
 
         self.result_fields = fields + custom_fields
@@ -2801,6 +3728,10 @@ class RosterExtractorWindow(QMainWindow):
 
                 if field in DISPLAY_FIELDS:
                     value = player.get(field, "")
+
+                elif field in self.review_fields:
+                    value = player.get(field, "")
+
                 else:
                     value = (
                         player.get("custom_fields") or {}
@@ -2822,14 +3753,10 @@ class RosterExtractorWindow(QMainWindow):
         )
 
         self.results_table.setAlternatingRowColors(True)
-
-        # Keep visual row order aligned with current_players.
         self.results_table.setSortingEnabled(False)
 
     def read_results(self):
         records = []
-
-        fields = self.result_fields
 
         for row in range(self.results_table.rowCount()):
 
@@ -2842,12 +3769,13 @@ class RosterExtractorWindow(QMainWindow):
                 player.get("custom_fields") or {}
             )
 
-            for column, field in enumerate(fields):
+            for column, field in enumerate(self.result_fields):
                 item = self.results_table.item(row, column)
 
                 value = item.text() if item else ""
 
                 if field in DISPLAY_FIELDS:
+
                     if field == "warnings":
                         value = [
                             warning.strip()
@@ -2856,6 +3784,10 @@ class RosterExtractorWindow(QMainWindow):
                         ]
 
                     player[field] = value
+
+                elif field in self.review_fields:
+                    player[field] = value
+
                 else:
                     custom_fields[field] = value
 
@@ -3070,10 +4002,113 @@ class RosterExtractorWindow(QMainWindow):
     # GENERAL INTERFACE
     # --------------------------------------------------------
 
+    def select_flagged_duplicates(self):
+        self.results_table.clearSelection()
+
+        status_column = None
+
+        for column, field in enumerate(self.result_fields):
+            if field == "duplicate_status":
+                status_column = column
+                break
+
+        if status_column is None:
+            QMessageBox.information(
+                self,
+                "No Duplicate Information",
+                "There is no duplicate-review information to select."
+            )
+            return
+
+        selected_count = 0
+
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(
+                row,
+                status_column
+            )
+
+            if not item:
+                continue
+
+            status = item.text().strip().casefold()
+
+            if status and status not in {
+                "unique",
+                "none",
+                "not flagged",
+            }:
+                self.results_table.selectRow(row)
+                selected_count += 1
+
+        self.status_label.setText(
+            f"Selected {selected_count} flagged duplicate records."
+        )
+
+        if selected_count == 0:
+            QMessageBox.information(
+                self,
+                "No Flagged Duplicates",
+                "No flagged duplicate records were found."
+            )
+
+    def delete_selected_rows(self):
+        selected_rows = sorted(
+            {
+                index.row()
+                for index in self.results_table.selectionModel().selectedRows()
+            },
+            reverse=True
+        )
+
+        if not selected_rows:
+            QMessageBox.information(
+                self,
+                "Nothing Selected",
+                "Select one or more player rows first."
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Confirm Removal",
+            (
+                f"Remove {len(selected_rows)} selected player records "
+                "from the current preview?\n\n"
+                "This does not delete records already saved "
+                "in the local library."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        for row in selected_rows:
+            if 0 <= row < len(self.current_players):
+                self.current_players.pop(row)
+
+        self.display_players(self.current_players)
+
+        self.set_actions_enabled(
+            bool(self.current_players)
+        )
+
+        self.status_label.setText(
+            f"Removed {len(selected_rows)} records from the current preview. "
+            f"{len(self.current_players)} records remain."
+        )
+
+
+
     def set_actions_enabled(self, enabled):
         self.save_button.setEnabled(enabled)
         self.json_button.setEnabled(enabled)
         self.csv_button.setEnabled(enabled)
+        self.select_flagged_button.setEnabled(enabled)
+        self.delete_selected_button.setEnabled(enabled)
 
     def clear_results(self):
         self.current_players = []

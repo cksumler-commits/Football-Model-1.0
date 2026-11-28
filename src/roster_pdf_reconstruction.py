@@ -2,6 +2,9 @@
 import re
 from statistics import median
 
+from pdf_document_engine import analyze_pdf_document
+from pdf_structure_analyzer import analyze_page_structure
+
 import pymupdf
 
 
@@ -475,29 +478,30 @@ def _merge_record_rows(page_number, row_group, anchor_row_index):
 
 def _normalize_reconstructed_records(records, median_height):
     """
-    Organize already-reconstructed candidate records into
-    shared, unlabeled columns.
+    Organize reconstructed candidates into generic, record-relative
+    fields. No football-specific field interpretation occurs here.
 
-    This function does not identify football fields, remove
-    information, or change the original reconstructed cells.
-
-    It uses the source-word coordinates to find recurring
-    horizontal column positions across reconstructed records.
+    Original source words and fragments are preserved.
     """
 
     record_rows = {}
-    all_rows = []
+    observations = []
+    total_visual_rows = 0
 
-    row_tolerance = max(2.0, median_height * 0.65)
-
-    # --------------------------------------------------
-    # REBUILD VISUAL ROWS FROM RECONSTRUCTED RECORDS
-    # --------------------------------------------------
+    gap_threshold = max(5.0, median_height * 1.35)
+    relative_tolerance = 0.035
 
     for record in records:
         record_id = record.get("record_id")
-
         source_words = record.get("source_words", [])
+        record_bbox = record.get("bbox")
+
+        if not record_bbox or len(record_bbox) != 4:
+            record_rows[record_id] = []
+            continue
+
+        record_x0, _, record_x1, _ = map(float, record_bbox)
+        record_width = max(1.0, record_x1 - record_x0)
 
         geometries = [
             geometry
@@ -510,80 +514,154 @@ def _normalize_reconstructed_records(records, median_height):
 
         rows = _group_visual_rows(
             geometries,
-            row_tolerance,
+            max(2.0, median_height * 0.65),
         )
 
         record_rows[record_id] = rows
-        all_rows.extend(rows)
+        total_visual_rows += len(rows)
 
-    # --------------------------------------------------
-    # DETECT SHARED GENERIC COLUMN POSITIONS
-    # --------------------------------------------------
+        for row_index, row in enumerate(rows):
+            row_key = f"{record_id}:{row_index}"
 
-    if all_rows:
-        boundaries, gap_threshold, position_tolerance = (
-            _detect_columns(
-                all_rows,
-                median_height,
+            for left, right in zip(row, row[1:]):
+                gap = right["x0"] - left["x1"]
+
+                if gap < gap_threshold:
+                    continue
+
+                relative_x = (
+                    right["x0"] - record_x0
+                ) / record_width
+
+                if 0.02 < relative_x < 0.98:
+                    observations.append({
+                        "x": relative_x,
+                        "record_id": record_id,
+                        "row_key": row_key,
+                        "gap": gap,
+                    })
+
+    # Cluster recurring relative gaps across candidates.
+    clusters = []
+
+    for observation in sorted(
+        observations,
+        key=lambda item: item["x"],
+    ):
+        matching = None
+
+        for cluster in clusters:
+            center = median(
+                item["x"] for item in cluster
             )
-        )
-    else:
-        boundaries = []
-        gap_threshold = 0.0
-        position_tolerance = 0.0
+
+            if abs(observation["x"] - center) <= relative_tolerance:
+                matching = cluster
+                break
+
+        if matching is None:
+            clusters.append([observation])
+        else:
+            matching.append(observation)
+
+    boundaries = []
+    minimum_record_support = 2 if len(records) > 1 else 1
+
+    for cluster in clusters:
+        record_support = len({
+            item["record_id"] for item in cluster
+        })
+
+        row_support = len({
+            item["row_key"] for item in cluster
+        })
+
+        if (
+            record_support >= minimum_record_support
+            or row_support >= 2
+        ):
+            boundaries.append({
+                "x": median(item["x"] for item in cluster),
+                "record_support": record_support,
+                "row_support": row_support,
+                "observations": len(cluster),
+            })
+
+    boundaries.sort(key=lambda item: item["x"])
 
     column_count = len(boundaries) + 1
 
-    columns = []
-
-    for column_index in range(column_count):
-        x_start = (
-            boundaries[column_index - 1]["x"]
-            if column_index > 0
-            else None
-        )
-
-        columns.append({
-            "column_index": column_index,
-            "label": f"Field {column_index + 1}",
-            "x_start": x_start,
-        })
-
-    # --------------------------------------------------
-    # ORGANIZE EACH RECORD INTO THE SHARED COLUMNS
-    # --------------------------------------------------
+    columns = [
+        {
+            "column_index": index,
+            "label": f"Field {index + 1}",
+            "x_start_relative": (
+                boundaries[index - 1]["x"]
+                if index > 0
+                else 0.0
+            ),
+        }
+        for index in range(column_count)
+    ]
 
     normalized_records = {}
 
     for record in records:
         record_id = record.get("record_id")
         rows = record_rows.get(record_id, [])
+        record_bbox = record.get("bbox")
+
+        if not record_bbox:
+            normalized_records[record_id] = []
+            continue
+
+        record_x0, _, record_x1, _ = map(float, record_bbox)
+        record_width = max(1.0, record_x1 - record_x0)
 
         field_fragments = [
             [] for _ in range(column_count)
         ]
 
         for visual_row_index, row in enumerate(rows):
-            row_cells = _split_row_into_cells(
-                row,
-                boundaries,
-                position_tolerance,
-            )
+            cell_words = [
+                [] for _ in range(column_count)
+            ]
 
-            for cell in row_cells:
-                column_index = cell["column_index"]
+            for word in row:
+                relative_x = (
+                    word["x0"] - record_x0
+                ) / record_width
 
-                if column_index >= column_count:
+                column_index = 0
+
+                for boundary_index, boundary in enumerate(boundaries):
+                    if relative_x >= boundary["x"] - relative_tolerance:
+                        column_index = boundary_index + 1
+
+                cell_words[column_index].append(word)
+
+            for column_index, words in enumerate(cell_words):
+                if not words:
                     continue
 
-                if not cell["text"]:
-                    continue
+                words.sort(key=lambda item: item["x0"])
+
+                bbox = [
+                    min(item["x0"] for item in words),
+                    min(item["y0"] for item in words),
+                    max(item["x1"] for item in words),
+                    max(item["y1"] for item in words),
+                ]
 
                 field_fragments[column_index].append({
                     "visual_row_index": visual_row_index,
-                    "text": cell["text"],
-                    "bbox": cell.get("bbox"),
-                    "source_words": cell.get("words", []),
+                    "text": " ".join(
+                        item["text"] for item in words
+                    ),
+                    "bbox": bbox,
+                    "source_words": [
+                        item["source"] for item in words
+                    ],
                 })
 
         normalized_fields = []
@@ -614,17 +692,14 @@ def _normalize_reconstructed_records(records, median_height):
             normalized_fields.append({
                 "field_index": column_index,
                 "label": f"Field {column_index + 1}",
-
                 "text": "\n".join(
                     fragment["text"]
                     for fragment in fragments
                 ),
-
                 "fragments": fragments,
                 "source_words": source_words,
                 "bbox": field_bbox,
                 "word_count": len(source_words),
-
                 "contributing_visual_rows": [
                     fragment["visual_row_index"]
                     for fragment in fragments
@@ -634,31 +709,628 @@ def _normalize_reconstructed_records(records, median_height):
         normalized_records[record_id] = normalized_fields
 
     return {
-        "strategy": "shared_horizontal_alignment",
+        "strategy": "record_relative_alignment",
         "column_count": column_count,
         "columns": columns,
         "records": normalized_records,
         "diagnostics": {
             "records_processed": len(records),
-            "visual_rows_processed": len(all_rows),
-            "column_boundaries": boundaries,
+            "visual_rows_processed": total_visual_rows,
+            "relative_column_boundaries": boundaries,
             "gap_threshold": round(gap_threshold, 2),
-            "position_tolerance": round(
-                position_tolerance,
-                2,
-            ),
+            "relative_position_tolerance": relative_tolerance,
         },
+    }
+
+
+def _bbox_union(boxes):
+    """Return the bounding box enclosing all valid boxes."""
+
+    valid = [
+        box for box in boxes
+        if isinstance(box, (list, tuple)) and len(box) == 4
+    ]
+
+    if not valid:
+        return None
+
+    return [
+        min(float(box[0]) for box in valid),
+        min(float(box[1]) for box in valid),
+        max(float(box[2]) for box in valid),
+        max(float(box[3]) for box in valid),
+    ]
+
+
+def _table_row_source_lines(row):
+    """Collect source lines from every cell in a structural table row."""
+
+    result = []
+
+    for cell in row.get("cells", []):
+        result.extend(cell.get("source_lines", []))
+
+    return result
+
+
+def _build_structural_regions(structure_page):
+    """
+    Convert domain-neutral structural detections into regions
+    that the roster-specific reconstruction layer can process.
+
+    A table row is kept separate from the rest of its table.
+    """
+
+    if not structure_page:
+        return []
+
+    regions = []
+
+    def add_region(region_type, bbox, source_lines=None, evidence=None):
+        source_lines = source_lines or []
+
+        unique_lines = []
+        seen = set()
+
+        for line in source_lines:
+            line_bbox = line.get("bbox")
+            text = str(line.get("text", "")).strip()
+
+            if not line_bbox or len(line_bbox) != 4:
+                continue
+
+            key = (
+                tuple(round(float(value), 2) for value in line_bbox),
+                text,
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique_lines.append(line)
+
+        line_boxes = [
+            line["bbox"]
+            for line in unique_lines
+        ]
+
+        if not bbox:
+            bbox = _bbox_union(line_boxes)
+
+        if not bbox:
+            return
+
+        regions.append({
+            "region_id": f"region_{len(regions) + 1}",
+            "region_type": region_type,
+            "bbox": list(map(float, bbox)),
+            "source_lines": unique_lines,
+            "_line_boxes": line_boxes,
+            "evidence": evidence or {},
+        })
+
+    # --------------------------------------------------
+    # TABLES: create one structural region per table row.
+    # --------------------------------------------------
+
+    for table in structure_page.get("tables", []):
+        table_bbox = table.get("bbox")
+        rows = table.get("rows", [])
+        row_boundaries = table.get("row_boundaries", [])
+
+        if rows:
+            for row_index, row in enumerate(rows):
+                source_lines = _table_row_source_lines(row)
+
+                row_bbox = row.get("bbox")
+
+                if not row_bbox and (
+                    table_bbox
+                    and len(row_boundaries) > row_index + 1
+                ):
+                    row_bbox = [
+                        table_bbox[0],
+                        row_boundaries[row_index],
+                        table_bbox[2],
+                        row_boundaries[row_index + 1],
+                    ]
+
+                add_region(
+                    "table_row",
+                    row_bbox,
+                    source_lines,
+                    {
+                        "table_index": table.get("table_index"),
+                        "row_index": row_index,
+                        "structure_type": table.get("structure_type"),
+                    },
+                )
+
+        elif (
+            table_bbox
+            and len(row_boundaries) >= 2
+        ):
+            for row_index in range(len(row_boundaries) - 1):
+                row_bbox = [
+                    table_bbox[0],
+                    row_boundaries[row_index],
+                    table_bbox[2],
+                    row_boundaries[row_index + 1],
+                ]
+
+                add_region(
+                    "table_row",
+                    row_bbox,
+                    evidence={
+                        "table_index": table.get("table_index"),
+                        "row_index": row_index,
+                    },
+                )
+
+        else:
+            add_region(
+                "table",
+                table_bbox,
+                evidence={
+                    "table_index": table.get("table_index"),
+                },
+            )
+
+    # --------------------------------------------------
+    # REPEATED OUTLINED CONTAINERS.
+    # --------------------------------------------------
+
+    for container in structure_page.get("containers", []):
+        add_region(
+            "container",
+            container.get("bbox"),
+            container.get("source_lines", []),
+            {
+                "container_index": container.get("container_index"),
+                "container_type": container.get("container_type"),
+                "detection_evidence": container.get(
+                    "detection_evidence", {}
+                ),
+            },
+        )
+
+    # --------------------------------------------------
+    # SEPARATOR-DELIMITED REGIONS.
+    # --------------------------------------------------
+
+    for separator in structure_page.get("separator_regions", []):
+        add_region(
+            "separator_region",
+            separator.get("bbox"),
+            separator.get("source_lines", []),
+            {
+                "region_index": separator.get("region_index"),
+                "assignment_confidence": separator.get(
+                    "assignment_confidence"
+                ),
+                "detection_evidence": separator.get(
+                    "detection_evidence", {}
+                ),
+            },
+        )
+
+    # --------------------------------------------------
+    # REMAINING UNCLASSIFIED TEXT REGIONS.
+    # --------------------------------------------------
+
+    for text_region in structure_page.get("text_regions", []):
+        add_region(
+            "text_region",
+            text_region.get("bbox"),
+            text_region.get("source_lines", []),
+            {
+                "region_index": text_region.get("region_index"),
+                "interpretation_status": "unclassified",
+            },
+        )
+
+    regions.sort(
+        key=lambda region: (
+            region["bbox"][1],
+            region["bbox"][0],
+        )
+    )
+
+    return regions
+
+
+def _point_inside_bbox(x, y, bbox, tolerance=1.5):
+    """Check whether a point lies inside a bounding box."""
+
+    return (
+        bbox[0] - tolerance <= x <= bbox[2] + tolerance
+        and bbox[1] - tolerance <= y <= bbox[3] + tolerance
+    )
+
+
+def _assign_words_to_structural_regions(geometries, structure_page):
+    """
+    Assign each word to at most one structural region.
+
+    Source-line geometry is preferred over broad region geometry.
+    Words that cannot be assigned are preserved in a page-remainder
+    region rather than discarded.
+    """
+
+    regions = _build_structural_regions(structure_page)
+
+    if not regions:
+        if not geometries:
+            return []
+
+        return [{
+            "region_id": "page_fallback",
+            "region_type": "page_remainder",
+            "bbox": _bbox_union([
+                [
+                    item["x0"],
+                    item["y0"],
+                    item["x1"],
+                    item["y1"],
+                ]
+                for item in geometries
+            ]),
+            "evidence": {
+                "reason": "No usable structural regions were detected.",
+            },
+            "geometries": list(geometries),
+        }]
+
+    for region in regions:
+        region["geometries"] = []
+
+    remainder = []
+
+    for geometry in geometries:
+        center_x = geometry["cx"]
+        center_y = geometry["cy"]
+
+        matches = []
+
+        for region in regions:
+            line_matches = [
+                bbox
+                for bbox in region["_line_boxes"]
+                if _point_inside_bbox(
+                    center_x,
+                    center_y,
+                    bbox,
+                )
+            ]
+
+            if line_matches:
+                best_box = min(
+                    line_matches,
+                    key=lambda box: (
+                        max(0.0, box[2] - box[0])
+                        * max(0.0, box[3] - box[1])
+                    ),
+                )
+
+                area = (
+                    max(0.0, best_box[2] - best_box[0])
+                    * max(0.0, best_box[3] - best_box[1])
+                )
+
+                matches.append((area, region))
+                continue
+
+            # Only use a broad region bbox when it has no
+            # source-line geometry to provide a better match.
+            if (
+                not region["_line_boxes"]
+                and _point_inside_bbox(
+                    center_x,
+                    center_y,
+                    region["bbox"],
+                )
+            ):
+                bbox = region["bbox"]
+                area = (
+                    max(0.0, bbox[2] - bbox[0])
+                    * max(0.0, bbox[3] - bbox[1])
+                )
+
+                matches.append((area, region))
+
+        if matches:
+            matches.sort(
+                key=lambda item: (
+                    item[0],
+                    item[1]["bbox"][1],
+                    item[1]["bbox"][0],
+                )
+            )
+
+            matches[0][1]["geometries"].append(geometry)
+        else:
+            remainder.append(geometry)
+
+    regions = [
+        region
+        for region in regions
+        if region["geometries"]
+    ]
+
+    if remainder:
+        regions.append({
+            "region_id": "page_remainder",
+            "region_type": "page_remainder",
+            "bbox": _bbox_union([
+                [
+                    item["x0"],
+                    item["y0"],
+                    item["x1"],
+                    item["y1"],
+                ]
+                for item in remainder
+            ]),
+            "evidence": {
+                "reason": "Words not assigned to a detected structural region.",
+            },
+            "geometries": remainder,
+        })
+
+    return regions
+
+
+def _lane_anchor_support(rows):
+    """
+    Count rows that independently resemble record anchors.
+
+    This is used only to decide whether a horizontal whitespace
+    gap separates two parallel content lanes.
+    """
+
+    support = 0
+
+    for row in rows:
+        features = _row_features([], _row_text(row))
+
+        signal_count = sum([
+            features["has_position"],
+            features["has_height"],
+            features["has_weight"],
+            features["has_class"],
+        ])
+
+        if (
+            features["is_anchor"]
+            or (
+                features["has_name_like_text"]
+                and signal_count >= 2
+            )
+        ):
+            support += 1
+
+    return support
+
+
+def _detect_parallel_lanes(geometries, median_height):
+    """
+    Detect independent left/right content lanes.
+
+    A gap is accepted only when both sides independently contain
+    record-like evidence. Ordinary gaps between fields should not
+    qualify merely because they are wide.
+    """
+
+    if len(geometries) < 4:
+        return None
+
+    row_tolerance = max(2.0, median_height * 0.65)
+
+    rows = _group_visual_rows(
+        geometries,
+        row_tolerance,
+    )
+
+    if not rows:
+        return None
+
+    region_bbox = _bbox_union([
+        [
+            item["x0"],
+            item["y0"],
+            item["x1"],
+            item["y1"],
+        ]
+        for item in geometries
+    ])
+
+    if not region_bbox:
+        return None
+
+    region_width = max(
+        1.0,
+        region_bbox[2] - region_bbox[0],
+    )
+
+    gap_threshold = max(
+        12.0,
+        median_height * 2.0,
+    )
+
+    observations = []
+
+    for row_index, row in enumerate(rows):
+        for left, right in zip(row, row[1:]):
+            gap = right["x0"] - left["x1"]
+
+            if gap < gap_threshold:
+                continue
+
+            split_x = (left["x1"] + right["x0"]) / 2
+
+            relative_x = (
+                split_x - region_bbox[0]
+            ) / region_width
+
+            # A parallel-lane divider should not sit at an
+            # extreme edge of the region.
+            if not 0.20 <= relative_x <= 0.80:
+                continue
+
+            observations.append({
+                "x": split_x,
+                "row": row_index,
+                "gap": gap,
+            })
+
+    if not observations:
+        return None
+
+    minimum_support = (
+        1 if len(rows) == 1
+        else max(2, int(len(rows) * 0.20))
+    )
+
+    candidates = _cluster_positions(
+        observations,
+        max(4.0, median_height * 0.8),
+        minimum_support,
+    )
+
+    accepted = []
+
+    for candidate in candidates:
+        split_x = candidate["x"]
+
+        left_words = [
+            item for item in geometries
+            if item["cx"] < split_x
+        ]
+
+        right_words = [
+            item for item in geometries
+            if item["cx"] >= split_x
+        ]
+
+        if len(left_words) < 3 or len(right_words) < 3:
+            continue
+
+        left_rows = _group_visual_rows(
+            left_words,
+            row_tolerance,
+        )
+
+        right_rows = _group_visual_rows(
+            right_words,
+            row_tolerance,
+        )
+
+        left_anchor_support = _lane_anchor_support(left_rows)
+        right_anchor_support = _lane_anchor_support(right_rows)
+
+        if left_anchor_support < 1 or right_anchor_support < 1:
+            continue
+
+        paired_rows = 0
+
+        for row in rows:
+            has_left = any(
+                item["cx"] < split_x for item in row
+            )
+            has_right = any(
+                item["cx"] >= split_x for item in row
+            )
+
+            if has_left and has_right:
+                paired_rows += 1
+
+        if paired_rows < 1:
+            continue
+
+        left_y0 = min(item["y0"] for item in left_words)
+        left_y1 = max(item["y1"] for item in left_words)
+
+        right_y0 = min(item["y0"] for item in right_words)
+        right_y1 = max(item["y1"] for item in right_words)
+
+        overlap = max(
+            0.0,
+            min(left_y1, right_y1) - max(left_y0, right_y0),
+        )
+
+        shorter_extent = max(
+            1.0,
+            min(left_y1 - left_y0, right_y1 - right_y0),
+        )
+
+        overlap_ratio = overlap / shorter_extent
+
+        if overlap_ratio < 0.35:
+            continue
+
+        score = (
+            candidate["row_support"] * 2
+            + paired_rows
+            + left_anchor_support
+            + right_anchor_support
+            + min(2.0, candidate["observations"] * 0.25)
+        )
+
+        accepted.append({
+            "split_x": split_x,
+            "score": score,
+            "row_support": candidate["row_support"],
+            "paired_rows": paired_rows,
+            "left_anchor_support": left_anchor_support,
+            "right_anchor_support": right_anchor_support,
+            "overlap_ratio": round(overlap_ratio, 3),
+        })
+
+    if not accepted:
+        return None
+
+    accepted.sort(
+        key=lambda item: item["score"],
+        reverse=True,
+    )
+
+    best = accepted[0]
+    split_x = best["split_x"]
+
+    return {
+        "lanes": [
+            {
+                "lane_index": 0,
+                "x_min": region_bbox[0],
+                "x_max": split_x,
+            },
+            {
+                "lane_index": 1,
+                "x_min": split_x,
+                "x_max": region_bbox[2],
+            },
+        ],
+        "evidence": best,
     }
 
 
 
 
 
+def _reconstruct_page(page_number, source_words, structure_page=None):
+    """
+    Reconstruct candidate records using document structure first,
+    spatial lanes second, and roster-like evidence third.
 
-def _reconstruct_page(page_number, source_words):
+    No source word is silently discarded.
+    """
+
     geometries = [
-        item for item in
-        (_word_geometry(word) for word in source_words)
+        item
+        for item in (
+            _word_geometry(word)
+            for word in source_words
+        )
         if item is not None
     ]
 
@@ -671,7 +1343,7 @@ def _reconstruct_page(page_number, source_words):
             "records": [],
             "columns": [],
             "normalization": {
-                "strategy": "shared_horizontal_alignment",
+                "strategy": "record_relative_alignment",
                 "column_count": 0,
                 "columns": [],
                 "records": {},
@@ -683,32 +1355,53 @@ def _reconstruct_page(page_number, source_words):
             },
             "unassigned_text": "",
             "unassigned_content": [],
+            "structure": structure_page or {},
             "diagnostics": {
                 "word_count": 0,
                 "row_count": 0,
                 "record_count": 0,
                 "column_count": 0,
+                "structural_region_count": 0,
+                "parallel_lane_count": 0,
                 "reason": "No usable word geometry was extracted.",
             },
         }
 
-    median_height = median(item["height"] for item in geometries)
-    row_tolerance = max(2.0, median_height * 0.65)
+    median_height = median(
+        item["height"] for item in geometries
+    )
 
-    rows = _group_visual_rows(geometries, row_tolerance)
+    row_tolerance = max(
+        2.0,
+        median_height * 0.65,
+    )
 
-    column_starts, gap_threshold, position_tolerance = (
-        _detect_columns(rows, median_height)
+    # --------------------------------------------------
+    # 1. BUILD PAGE-LEVEL VISUAL ROWS.
+    #
+    # These are retained for the inspector and diagnostics.
+    # They are not used as the primary record boundaries.
+    # --------------------------------------------------
+
+    page_rows = _group_visual_rows(
+        geometries,
+        row_tolerance,
+    )
+
+    page_column_starts, gap_threshold, position_tolerance = (
+        _detect_columns(
+            page_rows,
+            median_height,
+        )
     )
 
     visual_rows = []
-    metadata_rows = []
-    eligible_rows = []
+    source_to_global_row = {}
 
-    for row_index, row in enumerate(rows):
+    for row_index, row in enumerate(page_rows):
         cells = _split_row_into_cells(
             row,
-            column_starts,
+            page_column_starts,
             position_tolerance,
         )
 
@@ -724,11 +1417,13 @@ def _reconstruct_page(page_number, source_words):
         features = _row_features(cells, text)
 
         nonempty_cells = [
-            cell for cell in cells if cell["text"]
+            cell for cell in cells
+            if cell["text"]
         ]
 
         header_hits = sum(
-            1 for cell in nonempty_cells
+            1
+            for cell in nonempty_cells
             if _is_header_text(cell["text"])
         )
 
@@ -742,7 +1437,14 @@ def _reconstruct_page(page_number, source_words):
 
         is_metadata = _is_page_metadata(text)
 
-        row_result = {
+        source_row_words = [
+            word["source"] for word in row
+        ]
+
+        for word in source_row_words:
+            source_to_global_row[id(word)] = row_index
+
+        visual_rows.append({
             "row_index": row_index,
             "text": text,
             "cells": cells,
@@ -750,102 +1452,439 @@ def _reconstruct_page(page_number, source_words):
             "word_count": len(row),
             "is_header_candidate": is_header,
             "is_metadata_candidate": is_metadata,
-            "source_words": [word["source"] for word in row],
+            "source_words": source_row_words,
             "features": features,
-        }
-
-        visual_rows.append(row_result)
-
-        if is_header or is_metadata:
-            metadata_rows.append(row_result)
-        else:
-            eligible_rows.append(row_result)
+        })
 
     # --------------------------------------------------
-    # FIND RECORD-START ROWS
+    # 2. ASSIGN WORDS TO STRUCTURAL REGIONS.
     # --------------------------------------------------
 
-    anchors = [
-        row for row in eligible_rows
-        if row["features"]["is_anchor"]
-    ]
-
-    if not anchors:
-        anchors = [
-            row for row in eligible_rows
-            if (
-                row["features"]["score"] >= 5
-                and len([
-                    cell for cell in row["cells"]
-                    if cell["text"]
-                ]) >= 3
-            )
-        ]
-
-    anchors.sort(key=lambda row: row["row_index"])
-
-    record_groups = []
-
-    if anchors:
-        anchor_centers = [
-            (row["bbox"][1] + row["bbox"][3]) / 2
-            for row in anchors
-        ]
-
-        for anchor_index, anchor in enumerate(anchors):
-            if anchor_index == 0:
-                top = float("-inf")
-            else:
-                top = (
-                    anchor_centers[anchor_index - 1]
-                    + anchor_centers[anchor_index]
-                ) / 2
-
-            if anchor_index == len(anchors) - 1:
-                bottom = float("inf")
-            else:
-                bottom = (
-                    anchor_centers[anchor_index]
-                    + anchor_centers[anchor_index + 1]
-                ) / 2
-
-            group = [
-                row for row in eligible_rows
-                if top < (
-                    (row["bbox"][1] + row["bbox"][3]) / 2
-                ) <= bottom
-            ]
-
-            if group:
-                record_groups.append((anchor, group))
+    structural_regions = _assign_words_to_structural_regions(
+        geometries,
+        structure_page,
+    )
 
     records = []
+    assigned_word_ids = set()
 
-    for anchor, group in record_groups:
-        record = _merge_record_rows(
-            page_number,
-            group,
-            anchor["row_index"],
-        )
+    candidate_number = 0
+    parallel_lane_count = 0
+    region_diagnostics = []
 
-        features = anchor["features"]
-        score = features["score"]
-
-        record["record_features"] = features
-        record["confidence_score"] = min(1.0, score / 9.0)
-
-        if score >= 7:
-            record["confidence"] = "medium"
-        else:
-            record["confidence"] = "low"
-
-        record["review_required"] = True
-        records.append(record)
+    base_segmentation_scores = {
+        "table_row": 0.92,
+        "table": 0.82,
+        "container": 0.88,
+        "separator_region": 0.84,
+        "text_region": 0.62,
+        "page_remainder": 0.42,
+    }
 
     # --------------------------------------------------
-    # GENERIC COLUMN NORMALIZATION
-    # Operates AFTER candidate records are reconstructed.
-    # Does not alter or delete original reconstructed data.
+    # 3. PROCESS EACH STRUCTURAL REGION INDEPENDENTLY.
+    # --------------------------------------------------
+
+    for region in structural_regions:
+        region_geometries = region.get("geometries", [])
+
+        if not region_geometries:
+            continue
+
+        region_type = region.get(
+            "region_type",
+            "page_remainder",
+        )
+
+        lane_result = _detect_parallel_lanes(
+            region_geometries,
+            median_height,
+        )
+
+        if lane_result:
+            lane_specs = lane_result["lanes"]
+            lane_evidence = lane_result["evidence"]
+            parallel_lane_count += len(lane_specs)
+        else:
+            region_bbox = _bbox_union([
+                [
+                    item["x0"],
+                    item["y0"],
+                    item["x1"],
+                    item["y1"],
+                ]
+                for item in region_geometries
+            ])
+
+            lane_specs = [{
+                "lane_index": 0,
+                "x_min": region_bbox[0],
+                "x_max": region_bbox[2],
+            }]
+
+            lane_evidence = None
+
+        region_record_count = 0
+
+        # --------------------------------------------------
+        # 4. PROCESS EACH LANE SEPARATELY.
+        # --------------------------------------------------
+
+        for lane in lane_specs:
+            lane_geometries = [
+                item
+                for item in region_geometries
+                if (
+                    lane["x_min"] - 1.0
+                    <= item["cx"]
+                    < lane["x_max"] + 1.0
+                )
+            ]
+
+            if not lane_geometries:
+                continue
+
+            lane_rows = _group_visual_rows(
+                lane_geometries,
+                row_tolerance,
+            )
+
+            lane_columns, lane_gap_threshold, lane_tolerance = (
+                _detect_columns(
+                    lane_rows,
+                    median_height,
+                )
+            )
+
+            candidate_rows = []
+
+            for local_row_index, row in enumerate(lane_rows):
+                cells = _split_row_into_cells(
+                    row,
+                    lane_columns,
+                    lane_tolerance,
+                )
+
+                text = _row_text(row)
+
+                bbox = [
+                    min(word["x0"] for word in row),
+                    min(word["y0"] for word in row),
+                    max(word["x1"] for word in row),
+                    max(word["y1"] for word in row),
+                ]
+
+                features = _row_features(cells, text)
+
+                nonempty_cells = [
+                    cell for cell in cells
+                    if cell["text"]
+                ]
+
+                header_hits = sum(
+                    1
+                    for cell in nonempty_cells
+                    if _is_header_text(cell["text"])
+                )
+
+                is_header = (
+                    header_hits >= 2
+                    or (
+                        len(nonempty_cells) == 1
+                        and _is_header_text(text)
+                    )
+                )
+
+                is_metadata = _is_page_metadata(text)
+
+                source_row_words = [
+                    word["source"] for word in row
+                ]
+
+                global_row_indices = [
+                    source_to_global_row[id(word)]
+                    for word in source_row_words
+                    if id(word) in source_to_global_row
+                ]
+
+                global_row_index = (
+                    min(global_row_indices)
+                    if global_row_indices
+                    else -1
+                )
+
+                candidate_rows.append({
+                    "row_index": global_row_index,
+                    "region_row_index": local_row_index,
+                    "text": text,
+                    "cells": cells,
+                    "bbox": bbox,
+                    "word_count": len(row),
+                    "is_header_candidate": is_header,
+                    "is_metadata_candidate": is_metadata,
+                    "source_words": source_row_words,
+                    "features": features,
+                })
+
+            eligible_rows = [
+                row
+                for row in candidate_rows
+                if (
+                    not row["is_header_candidate"]
+                    and not row["is_metadata_candidate"]
+                )
+            ]
+
+            if not eligible_rows:
+                continue
+
+            # --------------------------------------------------
+            # 5. FIND ANCHORS WITHIN THIS LANE ONLY.
+            # --------------------------------------------------
+
+            anchors = [
+                row
+                for row in eligible_rows
+                if row["features"]["is_anchor"]
+            ]
+
+            used_fallback_anchors = False
+
+            if not anchors:
+                fallback_anchors = [
+                    row
+                    for row in eligible_rows
+                    if (
+                        row["features"]["score"] >= 5
+                        and len([
+                            cell for cell in row["cells"]
+                            if cell["text"]
+                        ]) >= 2
+                    )
+                ]
+
+                if fallback_anchors:
+                    anchors = fallback_anchors
+                    used_fallback_anchors = True
+
+            anchors.sort(
+                key=lambda row: (
+                    row["bbox"][1],
+                    row["bbox"][0],
+                )
+            )
+
+            if not anchors:
+                continue
+
+            # --------------------------------------------------
+            # 6. BUILD RECORD GROUPS.
+            #
+            # A structural table row is already a record-sized
+            # region unless it contains independently detected
+            # parallel lanes.
+            #
+            # Other regions use vertical anchor bands, but only
+            # within their own lane.
+            # --------------------------------------------------
+
+            record_groups = []
+
+            if (
+                region_type == "table_row"
+                and len(anchors) == 1
+            ):
+                record_groups.append((
+                    anchors[0],
+                    eligible_rows,
+                ))
+
+            else:
+                anchor_centers = [
+                    (
+                        row["bbox"][1]
+                        + row["bbox"][3]
+                    ) / 2
+                    for row in anchors
+                ]
+
+                for anchor_index, anchor in enumerate(anchors):
+                    if anchor_index == 0:
+                        top = float("-inf")
+                    else:
+                        top = (
+                            anchor_centers[anchor_index - 1]
+                            + anchor_centers[anchor_index]
+                        ) / 2
+
+                    if anchor_index == len(anchors) - 1:
+                        bottom = float("inf")
+                    else:
+                        bottom = (
+                            anchor_centers[anchor_index]
+                            + anchor_centers[anchor_index + 1]
+                        ) / 2
+
+                    group = [
+                        row
+                        for row in eligible_rows
+                        if (
+                            top
+                            < (
+                                row["bbox"][1]
+                                + row["bbox"][3]
+                            ) / 2
+                            <= bottom
+                        )
+                    ]
+
+                    if group:
+                        record_groups.append((anchor, group))
+
+            # --------------------------------------------------
+            # 7. CREATE CANDIDATE RECORDS.
+            # --------------------------------------------------
+
+            for anchor, group in record_groups:
+                if not group:
+                    continue
+
+                record = _merge_record_rows(
+                    page_number,
+                    group,
+                    anchor["row_index"],
+                )
+
+                candidate_number += 1
+                region_record_count += 1
+
+                record["record_id"] = (
+                    f"page_{page_number}_"
+                    f"candidate_{candidate_number}"
+                )
+
+                record["record_features"] = (
+                    anchor["features"]
+                )
+
+                content_score = (
+                    anchor["features"]["score"]
+                )
+
+                content_confidence_score = min(
+                    1.0,
+                    content_score / 10.0,
+                )
+
+                segmentation_score = (
+                    base_segmentation_scores.get(
+                        region_type,
+                        0.50,
+                    )
+                )
+
+                if lane_result:
+                    segmentation_score = 0.78
+
+                if len(anchors) > 1:
+                    segmentation_score += 0.03
+
+                if used_fallback_anchors:
+                    segmentation_score -= 0.08
+
+                segmentation_score = max(
+                    0.0,
+                    min(1.0, segmentation_score),
+                )
+
+                if segmentation_score >= 0.85:
+                    segmentation_label = "high"
+                elif segmentation_score >= 0.65:
+                    segmentation_label = "medium"
+                else:
+                    segmentation_label = "low"
+
+                record["confidence"] = segmentation_label
+
+                # Keep the legacy field, but make it represent
+                # segmentation evidence rather than content clues.
+                record["confidence_score"] = round(
+                    segmentation_score,
+                    3,
+                )
+
+                record["content_confidence_score"] = round(
+                    content_confidence_score,
+                    3,
+                )
+
+                record["segmentation_confidence"] = (
+                    segmentation_label
+                )
+
+                record["segmentation_score"] = round(
+                    segmentation_score,
+                    3,
+                )
+
+                record["segmentation_method"] = (
+                    "structural_region_parallel_lane"
+                    if lane_result
+                    else f"structural_region_{region_type}"
+                )
+
+                record["structural_region_id"] = (
+                    region["region_id"]
+                )
+
+                record["structural_region_type"] = (
+                    region_type
+                )
+
+                record["structural_region_bbox"] = (
+                    region.get("bbox")
+                )
+
+                record["lane_index"] = lane["lane_index"]
+
+                record["lane_count"] = len(lane_specs)
+
+                record["lane_bounds"] = [
+                    lane["x_min"],
+                    lane["x_max"],
+                ]
+
+                record["boundary_evidence"] = {
+                    "region_type": region_type,
+                    "region_evidence": region.get(
+                        "evidence", {}
+                    ),
+                    "parallel_lane_evidence": lane_evidence,
+                    "anchor_count_in_lane": len(anchors),
+                    "used_fallback_anchor": used_fallback_anchors,
+                    "group_row_count": len(group),
+                }
+
+                record["review_required"] = True
+
+                records.append(record)
+
+                for word in record.get("source_words", []):
+                    assigned_word_ids.add(id(word))
+
+        region_diagnostics.append({
+            "region_id": region["region_id"],
+            "region_type": region_type,
+            "word_count": len(region_geometries),
+            "candidate_record_count": region_record_count,
+            "lane_split": bool(lane_result),
+            "lane_evidence": lane_evidence,
+        })
+
+    # --------------------------------------------------
+    # 8. GENERIC NORMALIZATION.
+    #
+    # This happens only after candidate boundaries exist.
     # --------------------------------------------------
 
     normalization = _normalize_reconstructed_records(
@@ -862,43 +1901,71 @@ def _reconstruct_page(page_number, source_words):
         )
 
     # --------------------------------------------------
-    # IDENTIFY UNASSIGNED CONTENT
+    # 9. PRESERVE EVERY WORD NOT ASSIGNED TO A CANDIDATE.
     # --------------------------------------------------
 
-    assigned_row_indices = {
-        row_index
-        for record in records
-        for row_index in record["row_indices"]
-    }
+    unassigned_geometries = [
+        geometry
+        for geometry in geometries
+        if id(geometry["source"]) not in assigned_word_ids
+    ]
 
-    unassigned_rows = [
-        row for row in visual_rows
-        if (
-            row["row_index"] not in assigned_row_indices
-            or row["is_header_candidate"]
-            or row["is_metadata_candidate"]
+    unassigned_rows = _group_visual_rows(
+        unassigned_geometries,
+        row_tolerance,
+    )
+
+    unassigned_content = []
+
+    for row in unassigned_rows:
+        text = _row_text(row)
+
+        source_row_words = [
+            word["source"] for word in row
+        ]
+
+        global_indices = [
+            source_to_global_row[id(word)]
+            for word in source_row_words
+            if id(word) in source_to_global_row
+        ]
+
+        global_row_index = (
+            min(global_indices)
+            if global_indices
+            else -1
         )
-    ]
 
-    unassigned_content = [
-        {
+        if _is_page_metadata(text):
+            reason = "page metadata"
+        elif _is_header_text(text):
+            reason = "header or field label"
+        else:
+            reason = "no sufficiently supported record boundary"
+
+        unassigned_content.append({
             "page_number": page_number,
-            "row_index": row["row_index"],
-            "text": row["text"],
-            "bbox": row["bbox"],
-            "reason": (
-                "header"
-                if row["is_header_candidate"]
-                else "page metadata"
-                if row["is_metadata_candidate"]
-                else "unassigned or ambiguous row"
-            ),
-            "source_words": row["source_words"],
-        }
-        for row in unassigned_rows
-    ]
+            "row_index": global_row_index,
+            "text": text,
+            "bbox": [
+                min(item["x0"] for item in row),
+                min(item["y0"] for item in row),
+                max(item["x1"] for item in row),
+                max(item["y1"] for item in row),
+            ],
+            "reason": reason,
+            "source_words": source_row_words,
+        })
 
-    column_count = len(column_starts) + 1 if rows else 0
+    # --------------------------------------------------
+    # 10. FINAL PAGE RESULT.
+    # --------------------------------------------------
+
+    structure_type = (
+        structure_page.get("structure_type")
+        if structure_page
+        else "unavailable"
+    )
 
     return {
         "page_number": page_number,
@@ -906,47 +1973,98 @@ def _reconstruct_page(page_number, source_words):
         "visual_rows": visual_rows,
         "rows": visual_rows,
         "records": records,
-        "columns": column_starts,
+        "columns": page_column_starts,
         "normalization": normalization,
+        "structure": structure_page or {},
+        "structural_regions": region_diagnostics,
         "unassigned_text": "\n".join(
-            item["text"] for item in unassigned_content
+            item["text"]
+            for item in unassigned_content
         ),
         "unassigned_content": unassigned_content,
         "diagnostics": {
             "word_count": len(geometries),
             "row_count": len(visual_rows),
             "record_count": len(records),
-            "column_count": column_count,
-            "anchor_count": len(anchors),
+            "column_count": len(page_column_starts) + 1,
+            "anchor_count": sum(
+                1
+                for record in records
+                if record.get("record_features", {}).get(
+                    "is_anchor"
+                )
+            ),
             "median_text_height": round(median_height, 2),
             "row_tolerance": round(row_tolerance, 2),
             "gap_threshold": round(gap_threshold, 2),
-            "column_boundaries": column_starts,
+            "column_boundaries": page_column_starts,
+            "structure_type": structure_type,
+            "structural_region_count": len(structural_regions),
+            "parallel_lane_count": parallel_lane_count,
+            "assigned_word_count": len(assigned_word_ids),
+            "unassigned_word_count": len(unassigned_geometries),
+            "segmentation_strategy": (
+                "structure_first_region_and_lane_segmentation"
+            ),
             "reason": (
-                "Visual rows were grouped around multi-signal "
-                "record anchors. Generic column normalization "
-                "was applied to reconstructed candidates."
+                "Candidate records were reconstructed inside "
+                "structural regions and independently supported "
+                "horizontal lanes. Generic normalization followed "
+                "candidate reconstruction."
                 if records
                 else
-                "No sufficiently supported player-record anchors "
-                "were found. Source rows were preserved for review."
+                "No sufficiently supported record boundaries "
+                "were found. All extracted words remain available "
+                "in unassigned content."
             ),
         },
     }
 
 
+
+
 def analyze_roster_pdf(pdf_path):
-    """Analyze every page and reconstruct grouped candidate records."""
+    """
+    Analyze the complete PDF using the shared document engine,
+    the domain-neutral structure analyzer, and roster-specific
+    reconstruction.
+    """
+
+    document_result = analyze_pdf_document(pdf_path)
 
     pages = []
+    structural_analysis_errors = []
 
-    with pymupdf.open(pdf_path) as document:
-        for page_index, page in enumerate(document):
-            source_words = _extract_page_words(page)
+    for document_page in document_result.get("pages", []):
+        page_number = document_page["page_number"]
+        source_words = document_page.get("words", [])
 
-            pages.append(
-                _reconstruct_page(page_index + 1, source_words)
+        structure_page = None
+
+        try:
+            structure_page = analyze_page_structure(
+                document_page
             )
+        except Exception as error:
+            structural_analysis_errors.append({
+                "page_number": page_number,
+                "error": (
+                    f"{type(error).__name__}: {error}"
+                ),
+            })
+
+        page_result = _reconstruct_page(
+            page_number,
+            source_words,
+            structure_page=structure_page,
+        )
+
+        if structure_page is None:
+            page_result["diagnostics"]["structure_error"] = (
+                structural_analysis_errors[-1]["error"]
+            )
+
+        pages.append(page_result)
 
     all_records = [
         record
@@ -961,24 +2079,42 @@ def analyze_roster_pdf(pdf_path):
     ]
 
     total_words = sum(
-        page["diagnostics"]["word_count"] for page in pages
+        page["diagnostics"]["word_count"]
+        for page in pages
+    )
+
+    assigned_words = sum(
+        page["diagnostics"]["assigned_word_count"]
+        for page in pages
+    )
+
+    unassigned_words = sum(
+        page["diagnostics"]["unassigned_word_count"]
+        for page in pages
     )
 
     return {
-        "pdf_path": str(pdf_path),
+        "pdf_path": document_result["file_path"],
         "page_count": len(pages),
         "pages": pages,
         "records": all_records,
         "unassigned_content": all_unassigned,
         "diagnostics": {
             "total_words": total_words,
+            "assigned_words": assigned_words,
+            "unassigned_words": unassigned_words,
             "total_candidate_records": len(all_records),
             "pages_with_records": sum(
-                bool(page["records"]) for page in pages
+                bool(page["records"])
+                for page in pages
+            ),
+            "structural_analysis_errors": (
+                structural_analysis_errors
             ),
             "message": (
-                "Automatic analysis completed. Records are grouped "
-                "candidates and still require semantic review."
+                "Automatic structural and roster reconstruction "
+                "completed. Candidate boundaries have separate "
+                "confidence evidence and still require review."
             ),
         },
     }
