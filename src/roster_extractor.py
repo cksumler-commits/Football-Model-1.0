@@ -425,117 +425,206 @@ class TableExtractor:
 
     @staticmethod
     def identify_columns(headers):
-
         mapping = {}
 
         for index, header in enumerate(headers):
-
             normalized = normalize_header(header)
 
             for field, aliases in HEADER_ALIASES.items():
-
                 if normalized in aliases:
                     mapping[field] = index
+                    break
 
         return mapping
 
     @staticmethod
-    def extract(soup):
-
+    def extract_candidates(soup):
         candidates = []
 
         for table in soup.find_all("table"):
-
             rows = table.find_all("tr")
 
-            for header_index, row in enumerate(rows[:8]):
-
-                cells = row.find_all(["th", "td"])
-
-                headers = [
-                    clean_text(
-                        cell.get_text(" ", strip=True)
-                    )
-                    for cell in cells
-                ]
-
-                mapping = TableExtractor.identify_columns(
-                    headers
+            for header_index, header_row in enumerate(rows[:12]):
+                header_cells = header_row.find_all(
+                    ["th", "td"],
+                    recursive=False
                 )
 
-                if (
-                    "name" in mapping
-                    and (
-                        "position" in mapping
-                        or "jersey_number" in mapping
-                    )
+                headers = [
+                    clean_text(cell.get_text(" ", strip=True))
+                    for cell in header_cells
+                ]
+
+                mapping = TableExtractor.identify_columns(headers)
+
+                if "name" not in mapping or len(mapping) < 2:
+                    continue
+
+                players = []
+
+                for row_index, row in enumerate(
+                    rows[header_index + 1:],
+                    start=header_index + 1
                 ):
+                    cells = row.find_all(
+                        ["td", "th"],
+                        recursive=False
+                    )
 
-                    score = len(mapping)
+                    if not cells:
+                        continue
 
-                    candidates.append((
-                        score,
-                        table,
-                        header_index,
-                        mapping
-                    ))
+                    values = [
+                        clean_text(cell.get_text(" ", strip=True))
+                        for cell in cells
+                    ]
 
-                    break
+                    player = empty_player()
+
+                    for field, column in mapping.items():
+                        if column < len(values):
+                            player[field] = values[column]
+
+                    name_column = mapping["name"]
+
+                    if name_column < len(cells):
+                        anchor = cells[name_column].find("a")
+
+                        if anchor:
+                            linked_name = clean_text(
+                                anchor.get_text(" ", strip=True)
+                            )
+
+                            if linked_name:
+                                player["name"] = linked_name
+
+                    # Preserve every source column, including columns
+                    # the extractor does not recognize.
+                    player["raw_fields"] = {
+                        header: (
+                            values[index]
+                            if index < len(values)
+                            else ""
+                        )
+                        for index, header in enumerate(headers)
+                    }
+
+                    player["custom_fields"] = {
+                        header: values[index]
+                        for index, header in enumerate(headers)
+                        if (
+                            index < len(values)
+                            and header
+                            and normalize_header(header)
+                            not in {
+                                alias
+                                for aliases in HEADER_ALIASES.values()
+                                for alias in aliases
+                            }
+                            and values[index]
+                        )
+                    }
+
+                    player["source_headers"] = list(headers)
+                    player["raw_source_row"] = list(values)
+                    player["source_row_index"] = row_index
+
+                    complete_player(player)
+
+                    if player["name"]:
+                        players.append(player)
+
+                players = TableExtractor.remove_duplicates(players)
+
+                if players:
+                    candidates.append({
+                        "method": "HTML Table",
+                        "players": players,
+                        "headers": headers,
+                        "score": TableExtractor.score(players),
+                    })
+
+                # A table should only have one header row.
+                break
+
+        return candidates
+
+    @staticmethod
+    def remove_duplicates(players):
+        unique = []
+        seen = set()
+
+        for player in players:
+            name = clean_text(player.get("name", "")).casefold()
+            number = clean_text(
+                player.get("jersey_number", "")
+            ).casefold()
+            position = clean_text(
+                player.get("position", "")
+            ).casefold()
+
+            # A name alone is not a safe identity.
+            if not name:
+                continue
+
+            if number:
+                key = (name, number)
+            elif position:
+                key = (
+                    name,
+                    position,
+                    clean_text(player.get("height", "")),
+                    clean_text(player.get("weight", "")),
+                )
+            else:
+                # Preserve records when there is not enough information
+                # to confidently identify them as the same player.
+                unique.append(player)
+                continue
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique.append(player)
+
+        return unique
+
+    @staticmethod
+    def score(players):
+        if not players:
+            return 0
+
+        populated = 0
+
+        for player in players:
+            populated += sum(
+                bool(clean_text(player.get(field, "")))
+                for field in PLAYER_FIELDS
+            )
+
+            populated += len(
+                player.get("custom_fields", {})
+            )
+
+        average = populated / len(players)
+
+        return len(players) * 100 + average * 10
+
+    @staticmethod
+    def extract(soup):
+        candidates = TableExtractor.extract_candidates(soup)
 
         if not candidates:
             return []
 
-        candidates.sort(
-            key=lambda item: item[0],
-            reverse=True
-        )
+        return max(
+            candidates,
+            key=lambda item: item["score"]
+        )["players"]
 
-        _, table, header_index, mapping = candidates[0]
 
-        players = []
-
-        rows = table.find_all("tr")
-
-        for row in rows[header_index + 1:]:
-
-            cells = row.find_all(["td", "th"])
-
-            if not cells:
-                continue
-
-            values = [
-                clean_text(
-                    cell.get_text(" ", strip=True)
-                )
-                for cell in cells
-            ]
-
-            player = empty_player()
-
-            for field, column in mapping.items():
-
-                if column < len(values):
-                    player[field] = values[column]
-
-            # Prefer linked player name when available.
-            name_index = mapping.get("name")
-
-            if name_index is not None and name_index < len(cells):
-
-                anchor = cells[name_index].find("a")
-
-                if anchor:
-                    player["name"] = clean_text(
-                        anchor.get_text(" ", strip=True)
-                    )
-
-            player = complete_player(player)
-
-            if player["name"]:
-                players.append(player)
-
-        return players
-
+    
 
 # ============================================================
 # EXTRACTION STRATEGY 2: ROSTER CARDS
@@ -555,75 +644,64 @@ class CardExtractor:
         "[class*='playerCard']",
     ]
 
-    FIELD_KEYWORDS = {
+    NAME_SELECTORS = [
+        ".sidearm-roster-player-name",
+        ".roster-player-name",
+        ".player-name",
+        "[class*='player-name']",
+        "h3",
+        "h2",
+    ]
 
+    FIELD_KEYWORDS = {
         "jersey_number": [
             "jersey-number",
             "player-number",
             "uniform-number",
             "number",
         ],
-
         "position": [
             "position",
             "player-position",
         ],
-
         "height": [
             "height",
             "player-height",
         ],
-
         "weight": [
             "weight",
             "player-weight",
         ],
-
         "class_year": [
             "academic-year",
             "class-year",
             "player-class",
             "academic-class",
+            "roster-class",
         ],
-
         "experience": [
             "experience",
         ],
-
         "hometown": [
             "hometown",
             "home-town",
         ],
-
         "high_school": [
             "highschool",
             "high-school",
         ],
-
         "previous_school": [
             "previous-school",
             "prev-school",
         ],
     }
 
-    @staticmethod
-    def find_name(card):
-
-        selectors = [
-            ".sidearm-roster-player-name",
-            ".roster-player-name",
-            ".player-name",
-            "[class*='player-name']",
-            "h3",
-            "h2",
-        ]
-
-        for selector in selectors:
-
+    @classmethod
+    def find_name(cls, card):
+        for selector in cls.NAME_SELECTORS:
             element = card.select_one(selector)
 
             if element:
-
                 name = clean_text(
                     element.get_text(" ", strip=True)
                 )
@@ -635,17 +713,12 @@ class CardExtractor:
 
     @staticmethod
     def find_field(card, keywords):
-
         for element in card.find_all(True):
-
             classes = element.get("class", [])
-
             class_text = " ".join(classes).lower()
 
             for keyword in keywords:
-
                 if keyword in class_text:
-
                     value = clean_text(
                         element.get_text(" ", strip=True)
                     )
@@ -653,48 +726,55 @@ class CardExtractor:
                     if value:
                         return value
 
-        # Try structured definition lists.
         for dt in card.find_all("dt"):
-
             label = normalize_header(
                 dt.get_text(" ", strip=True)
             )
 
-            following = dt.find_next_sibling("dd")
+            dd = dt.find_next_sibling("dd")
 
-            if following:
+            if not dd:
+                continue
 
-                for keyword in keywords:
-
-                    if normalize_header(keyword) in label:
-
-                        return clean_text(
-                            following.get_text(" ", strip=True)
-                        )
+            for keyword in keywords:
+                if normalize_header(keyword) in label:
+                    return clean_text(
+                        dd.get_text(" ", strip=True)
+                    )
 
         return ""
 
     @classmethod
     def extract(cls, soup):
-
-        cards = []
-        seen = set()
+        matched_cards = []
+        seen_ids = set()
 
         for selector in cls.CARD_SELECTORS:
+            for element in soup.select(selector):
+                if id(element) in seen_ids:
+                    continue
 
-            for card in soup.select(selector):
+                seen_ids.add(id(element))
+                matched_cards.append(element)
 
-                identity = id(card)
+        # If a matching element contains another matching element,
+        # prefer the inner element. This prevents a roster wrapper
+        # and its player card from being counted as separate players.
+        cards = []
 
-                if identity not in seen:
+        for element in matched_cards:
+            has_matching_child = any(
+                other is not element
+                and other in element.descendants
+                for other in matched_cards
+            )
 
-                    seen.add(identity)
-                    cards.append(card)
+            if not has_matching_child:
+                cards.append(element)
 
         players = []
 
         for card in cards:
-
             player = empty_player()
 
             player["name"] = cls.find_name(card)
@@ -703,18 +783,26 @@ class CardExtractor:
                 continue
 
             for field, keywords in cls.FIELD_KEYWORDS.items():
+                player[field] = cls.find_field(card, keywords)
 
-                player[field] = cls.find_field(
-                    card,
-                    keywords
-                )
+            card_text = clean_text(
+                card.get_text(" ", strip=True)
+            )
 
-            player = complete_player(player)
+            player["raw_fields"] = {
+                "Card Text": card_text
+            }
 
+            player["custom_fields"] = {}
+            player["source_headers"] = ["Card Text"]
+            player["raw_source_row"] = [card_text]
+
+            complete_player(player)
             players.append(player)
 
-        # Avoid nested card duplicates.
-        return players
+        return TableExtractor.remove_duplicates(players)
+
+    
 
 
 # ============================================================
@@ -725,53 +813,86 @@ class StructuredDataExtractor:
 
     @staticmethod
     def extract(soup):
-
         players = []
+
+        def walk(value):
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+
+            if not isinstance(value, dict):
+                return
+
+            item_type = value.get("@type", "")
+
+            if isinstance(item_type, list):
+                item_type = " ".join(str(item) for item in item_type)
+
+            item_type = str(item_type).lower()
+
+            name = clean_text(value.get("name", ""))
+
+            is_player = any(
+                marker in item_type
+                for marker in (
+                    "person",
+                    "athlete",
+                    "player",
+                )
+            )
+
+            if name and is_player:
+                player = empty_player()
+                player["name"] = name
+
+                field_aliases = {
+                    "height": "height",
+                    "weight": "weight",
+                    "jobTitle": "position",
+                    "honorificSuffix": "class_year",
+                }
+
+                for source_field, target_field in field_aliases.items():
+                    if value.get(source_field):
+                        player[target_field] = clean_text(
+                            value[source_field]
+                        )
+
+                raw_fields = {}
+
+                for key, item in value.items():
+                    if not isinstance(item, (dict, list)):
+                        raw_fields[str(key)] = clean_text(item)
+
+                player["raw_fields"] = raw_fields
+                player["custom_fields"] = {}
+                player["source_headers"] = list(raw_fields.keys())
+                player["raw_source_row"] = list(raw_fields.values())
+
+                complete_player(player)
+                players.append(player)
+
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    walk(nested)
 
         for script in soup.find_all(
             "script",
             type="application/ld+json"
         ):
-
             try:
-
                 data = json.loads(
                     script.string or script.get_text()
                 )
-
             except (json.JSONDecodeError, TypeError):
                 continue
 
-            objects = data if isinstance(data, list) else [data]
+            walk(data)
 
-            for obj in objects:
+        return TableExtractor.remove_duplicates(players)
 
-                if not isinstance(obj, dict):
-                    continue
-
-                entries = obj.get(
-                    "itemListElement",
-                    []
-                )
-
-                if entries:
-
-                    for entry in entries:
-
-                        item = entry.get("item", entry)
-
-                        if isinstance(item, dict):
-
-                            name = item.get("name", "")
-
-                            if name:
-                                player = empty_player()
-                                player["name"] = name
-                                players.append(
-                                    complete_player(player)
-                                )
-
-        return players
+    
 
 
 # ============================================================
@@ -782,28 +903,45 @@ class PlayerValidator:
 
     @staticmethod
     def validate(players):
-
-        seen = {}
+        seen = set()
 
         for player in players:
+            complete_player(player)
 
             warnings = []
 
             name = clean_text(
                 player.get("name", "")
-            )
+            ).casefold()
 
-            key = name.casefold()
+            number = clean_text(
+                player.get("jersey_number", "")
+            ).casefold()
+
+            position = clean_text(
+                player.get("position", "")
+            ).casefold()
 
             if not name:
                 warnings.append("Missing player name")
 
-            if key in seen:
-                warnings.append(
-                    "Possible duplicate player name"
+            # Only flag a duplicate when there is identifying
+            # information beyond the player's name.
+            if name and (number or position):
+                key = (
+                    name,
+                    number,
+                    position,
+                    clean_text(player.get("height", "")),
+                    clean_text(player.get("weight", "")),
                 )
 
-            seen[key] = True
+                if key in seen:
+                    warnings.append(
+                        "Possible duplicate player record"
+                    )
+
+                seen.add(key)
 
             if not player.get("position"):
                 warnings.append("Missing position")
@@ -818,7 +956,6 @@ class PlayerValidator:
 
         return players
 
-
 # ============================================================
 # MAIN EXTRACTION ENGINE
 # ============================================================
@@ -826,11 +963,200 @@ class PlayerValidator:
 class RosterEngine:
 
     @staticmethod
-    def extract(url, school="", season=""):
+    def build_url_variants(url):
+        variants = [url]
 
-        soup, final_url, retrieval_method = (
-            WebsiteRetriever.retrieve(url)
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+
+        if "lsusports.net" in hostname:
+            query = parse_qs(parsed.query)
+
+            if query.get("view", [""])[0].lower() != "table":
+                query["view"] = ["table"]
+
+                table_url = urlunparse((
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    urlencode(query, doseq=True),
+                    parsed.fragment,
+                ))
+
+                variants.append(table_url)
+
+        return variants
+
+    @staticmethod
+    def score_candidate(candidate):
+        players = candidate.get("players", [])
+
+        if not players:
+            return 0
+
+        populated = 0
+
+        for player in players:
+            populated += sum(
+                bool(clean_text(player.get(field, "")))
+                for field in PLAYER_FIELDS
+            )
+
+            populated += len(
+                player.get("custom_fields", {})
+            )
+
+        average = populated / len(players)
+
+        method_bonus = {
+            "HTML Table": 5,
+            "Roster Cards": 3,
+            "Structured JSON-LD": 0,
+        }.get(candidate.get("method"), 0)
+
+        return (
+            len(players) * 100
+            + average * 10
+            + method_bonus
         )
+
+    @staticmethod
+    def collect_candidates(soup):
+        candidates = []
+
+        try:
+            candidates.extend(
+                TableExtractor.extract_candidates(soup)
+            )
+        except Exception:
+            pass
+
+        try:
+            players = CardExtractor.extract(soup)
+
+            if players:
+                candidates.append({
+                    "method": "Roster Cards",
+                    "players": players,
+                })
+        except Exception:
+            pass
+
+        try:
+            players = StructuredDataExtractor.extract(soup)
+
+            if players:
+                candidates.append({
+                    "method": "Structured JSON-LD",
+                    "players": players,
+                })
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            candidate["players"] = TableExtractor.remove_duplicates(
+                candidate["players"]
+            )
+
+            candidate["score"] = RosterEngine.score_candidate(
+                candidate
+            )
+
+        return candidates
+
+    @staticmethod
+    def extract(url, school="", season=""):
+        original_url = url.strip()
+
+        if not original_url.startswith(("http://", "https://")):
+            original_url = "https://" + original_url
+
+        page_results = []
+        errors = []
+
+        for candidate_url in RosterEngine.build_url_variants(
+            original_url
+        ):
+            try:
+                soup, final_url, retrieval_method = (
+                    WebsiteRetriever.retrieve(
+                        candidate_url,
+                        use_browser=False
+                    )
+                )
+
+                page_results.append({
+                    "soup": soup,
+                    "final_url": final_url,
+                    "retrieval_method": retrieval_method,
+                })
+
+            except Exception as error:
+                errors.append(
+                    f"{candidate_url}: {error}"
+                )
+
+        best_candidate = None
+        best_page = None
+
+        for page in page_results:
+            candidates = RosterEngine.collect_candidates(
+                page["soup"]
+            )
+
+            for candidate in candidates:
+                if (
+                    best_candidate is None
+                    or candidate["score"] > best_candidate["score"]
+                ):
+                    best_candidate = candidate
+                    best_page = page
+
+        # JavaScript fallback if ordinary retrieval did not find
+        # a recognizable roster.
+        if best_candidate is None:
+            try:
+                soup, final_url, retrieval_method = (
+                    WebsiteRetriever.retrieve_browser(
+                        original_url
+                    )
+                )
+
+                page = {
+                    "soup": soup,
+                    "final_url": final_url,
+                    "retrieval_method": retrieval_method,
+                }
+
+                candidates = RosterEngine.collect_candidates(soup)
+
+                if candidates:
+                    best_candidate = max(
+                        candidates,
+                        key=lambda item: item["score"]
+                    )
+
+                    best_page = page
+
+            except Exception as error:
+                errors.append(
+                    f"Browser fallback: {error}"
+                )
+
+        if best_candidate is None:
+            message = (
+                "No recognizable roster structure was found. "
+                "The website may require a site-specific extraction adapter."
+            )
+
+            if errors:
+                message += "\n\n" + "\n".join(errors)
+
+            raise RuntimeError(message)
+
+        soup = best_page["soup"]
+        final_url = best_page["final_url"]
 
         title = ""
 
@@ -849,75 +1175,37 @@ class RosterEngine:
             or infer_season(soup, final_url)
         )
 
-        # Each strategy is attempted in order.
-        strategies = [
-            ("HTML Table", TableExtractor.extract),
-            ("Roster Cards", CardExtractor.extract),
-            (
-                "Structured JSON-LD",
-                StructuredDataExtractor.extract
-            ),
-        ]
-
-        players = []
-        extraction_method = ""
-
-        for method, extractor in strategies:
-
-            try:
-                players = extractor(soup)
-
-            except Exception:
-                players = []
-
-            if players:
-                extraction_method = method
-                break
-
-        if not players:
-
-            try:
-
-                soup, final_url, retrieval_method = (
-                 WebsiteRetriever.retrieve_browser(url)
-                )
-
-                for method, extractor in strategies:
-
-                    try:
-                        players = extractor(soup)
-
-                    except Exception:
-                        players = []
-
-                    if players:
-                        extraction_method = method
-                        break
-
-            except Exception:
-                players = []
-
-        if not players:
-
-         raise RuntimeError(
-        "No recognizable roster structure was found. "
-        "This website may require a custom extraction adapter."
+        players = TableExtractor.remove_duplicates(
+            best_candidate["players"]
         )
 
         for player in players:
-
             complete_player(player)
 
             player["school"] = detected_school
             player["season"] = detected_season
-            player["source_url"] = final_url
+
+            # Keep both the original submitted URL and the actual
+            # page variant used for extraction.
+            player["source_url"] = original_url
+            player["retrieved_url"] = final_url
+
             player["source_title"] = title
-            player["retrieval_method"] = retrieval_method
-            player["extraction_method"] = extraction_method
+            player["retrieval_method"] = (
+                best_page["retrieval_method"]
+            )
+            player["extraction_method"] = (
+                best_candidate["method"]
+            )
 
-        players = PlayerValidator.validate(players)
+            player.setdefault("raw_fields", {})
+            player.setdefault("custom_fields", {})
+            player.setdefault("source_headers", [])
+            player.setdefault("raw_source_row", [])
 
-        return players
+        return PlayerValidator.validate(players)
+
+    
 
 
 # ============================================================
@@ -926,18 +1214,21 @@ class RosterEngine:
 
 class RosterDatabase:
 
+    JSON_FIELDS = {
+        "warnings",
+        "raw_fields",
+        "custom_fields",
+        "source_headers",
+        "raw_source_row",
+    }
+
     def __init__(self):
-
-        self.connection = sqlite3.connect(
-            DATABASE_PATH
-        )
-
+        self.connection = sqlite3.connect(DATABASE_PATH)
         self.connection.row_factory = sqlite3.Row
 
         self.create_tables()
 
     def create_tables(self):
-
         cursor = self.connection.cursor()
 
         cursor.execute("""
@@ -981,15 +1272,37 @@ class RosterDatabase:
             )
         """)
 
+        # Add new columns without deleting or rebuilding old records.
+        existing_columns = {
+            row["name"]
+            for row in cursor.execute(
+                "PRAGMA table_info(players)"
+            ).fetchall()
+        }
+
+        new_columns = {
+            "retrieved_url": "TEXT",
+            "retrieval_method": "TEXT",
+            "raw_fields": "TEXT",
+            "custom_fields": "TEXT",
+            "source_headers": "TEXT",
+            "raw_source_row": "TEXT",
+        }
+
+        for column, column_type in new_columns.items():
+            if column not in existing_columns:
+                cursor.execute(
+                    f"ALTER TABLE players "
+                    f"ADD COLUMN {column} {column_type}"
+                )
+
         self.connection.commit()
 
     def save_roster(self, players):
-
         if not players:
             raise ValueError("No players to save.")
 
         first = players[0]
-
         cursor = self.connection.cursor()
 
         cursor.execute("""
@@ -1016,7 +1329,6 @@ class RosterDatabase:
         roster_id = cursor.lastrowid
 
         for player in players:
-
             cursor.execute("""
                 INSERT INTO players (
                     roster_id,
@@ -1037,10 +1349,18 @@ class RosterDatabase:
                     source_url,
                     source_title,
                     extraction_method,
-                    warnings
+                    warnings,
+                    retrieved_url,
+                    retrieval_method,
+                    raw_fields,
+                    custom_fields,
+                    source_headers,
+                    raw_source_row
                 )
                 VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
                 )
             """, (
                 roster_id,
@@ -1061,15 +1381,19 @@ class RosterDatabase:
                 player.get("source_url", ""),
                 player.get("source_title", ""),
                 player.get("extraction_method", ""),
-                json.dumps(player.get("warnings", [])),
+                json.dumps(player.get("warnings", []), ensure_ascii=False),
+                player.get("retrieved_url", ""),
+                player.get("retrieval_method", ""),
+                json.dumps(player.get("raw_fields", {}), ensure_ascii=False),
+                json.dumps(player.get("custom_fields", {}), ensure_ascii=False),
+                json.dumps(player.get("source_headers", []), ensure_ascii=False),
+                json.dumps(player.get("raw_source_row", []), ensure_ascii=False),
             ))
 
         self.connection.commit()
-
         return roster_id
 
     def get_rosters(self):
-
         cursor = self.connection.cursor()
 
         cursor.execute("""
@@ -1081,7 +1405,6 @@ class RosterDatabase:
         return cursor.fetchall()
 
     def get_players(self, roster_id):
-
         cursor = self.connection.cursor()
 
         cursor.execute("""
@@ -1097,6 +1420,8 @@ class RosterDatabase:
         self.connection.close()
 
 
+
+
 # ============================================================
 # EXPORT ENGINE
 # ============================================================
@@ -1105,13 +1430,11 @@ class RosterExporter:
 
     @staticmethod
     def export_json(players, path):
-
         with open(
             path,
             "w",
             encoding="utf-8"
         ) as file:
-
             json.dump(
                 players,
                 file,
@@ -1121,8 +1444,37 @@ class RosterExporter:
 
     @staticmethod
     def export_csv(players, path):
+        fields = list(DISPLAY_FIELDS)
 
-        fields = DISPLAY_FIELDS
+        custom_names = []
+        raw_names = []
+
+        for player in players:
+            for name in (player.get("custom_fields") or {}):
+                if name not in custom_names:
+                    custom_names.append(name)
+
+            for name in (player.get("raw_fields") or {}):
+                if name not in raw_names:
+                    raw_names.append(name)
+
+        for name in custom_names:
+            if name not in fields:
+                fields.append(name)
+
+        for name in raw_names:
+            source_name = f"Source: {name}"
+
+            if source_name not in fields:
+                fields.append(source_name)
+
+        for name in (
+            "retrieved_url",
+            "retrieval_method",
+            "extraction_method",
+        ):
+            if name not in fields:
+                fields.append(name)
 
         with open(
             path,
@@ -1130,7 +1482,6 @@ class RosterExporter:
             newline="",
             encoding="utf-8-sig"
         ) as file:
-
             writer = csv.DictWriter(
                 file,
                 fieldnames=fields,
@@ -1140,13 +1491,22 @@ class RosterExporter:
             writer.writeheader()
 
             for player in players:
-
                 row = dict(player)
 
                 warnings = row.get("warnings", [])
 
                 if isinstance(warnings, list):
                     row["warnings"] = "; ".join(warnings)
+
+                for name, value in (
+                    player.get("custom_fields") or {}
+                ).items():
+                    row[name] = value
+
+                for name, value in (
+                    player.get("raw_fields") or {}
+                ).items():
+                    row[f"Source: {name}"] = value
 
                 writer.writerow(row)
 
@@ -1223,7 +1583,6 @@ class ExtractionWorker(QThread):
 class RosterExtractorWindow(QMainWindow):
 
     def __init__(self):
-
         super().__init__()
 
         self.setWindowTitle(
@@ -1235,6 +1594,7 @@ class RosterExtractorWindow(QMainWindow):
         self.database = RosterDatabase()
 
         self.current_players = []
+        self.result_fields = list(DISPLAY_FIELDS)
         self.worker = None
 
         self.tabs = QTabWidget()
@@ -1263,14 +1623,8 @@ class RosterExtractorWindow(QMainWindow):
         self.build_library_tab()
 
         self.results_table = QTableWidget()
-
-        self.results_table.setColumnCount(
-            len(DISPLAY_FIELDS)
-        )
-
-        self.results_table.setHorizontalHeaderLabels(
-            DISPLAY_FIELDS
-        )
+        self.results_table.setColumnCount(len(DISPLAY_FIELDS))
+        self.results_table.setHorizontalHeaderLabels(DISPLAY_FIELDS)
 
         self.results_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.ResizeToContents
@@ -1281,7 +1635,6 @@ class RosterExtractorWindow(QMainWindow):
         self.status_label = QLabel("Ready.")
 
         self.progress_bar = QProgressBar()
-
         self.progress_bar.setVisible(False)
 
         main = QWidget()
@@ -1301,37 +1654,17 @@ class RosterExtractorWindow(QMainWindow):
 
         actions = QHBoxLayout()
 
-        self.save_button = QPushButton(
-            "Save to Local Library"
-        )
+        self.save_button = QPushButton("Save to Local Library")
+        self.save_button.clicked.connect(self.save_results)
 
-        self.save_button.clicked.connect(
-            self.save_results
-        )
+        self.json_button = QPushButton("Export JSON")
+        self.json_button.clicked.connect(self.export_json)
 
-        self.json_button = QPushButton(
-            "Export JSON"
-        )
+        self.csv_button = QPushButton("Export CSV")
+        self.csv_button.clicked.connect(self.export_csv)
 
-        self.json_button.clicked.connect(
-            self.export_json
-        )
-
-        self.csv_button = QPushButton(
-            "Export CSV"
-        )
-
-        self.csv_button.clicked.connect(
-            self.export_csv
-        )
-
-        self.clear_button = QPushButton(
-            "Clear Results"
-        )
-
-        self.clear_button.clicked.connect(
-            self.clear_results
-        )
+        self.clear_button = QPushButton("Clear Results")
+        self.clear_button.clicked.connect(self.clear_results)
 
         actions.addWidget(self.save_button)
         actions.addWidget(self.json_button)
@@ -1345,7 +1678,6 @@ class RosterExtractorWindow(QMainWindow):
         self.setCentralWidget(main)
 
         self.set_actions_enabled(False)
-
         self.refresh_library()
 
     # --------------------------------------------------------
@@ -1353,7 +1685,6 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def build_single_tab(self):
-
         layout = QVBoxLayout(self.single_tab)
 
         layout.addWidget(QLabel("Roster URL"))
@@ -1370,7 +1701,9 @@ class RosterExtractorWindow(QMainWindow):
 
         layout.addWidget(self.single_url)
 
-        layout.addWidget(QLabel("School / Team Name (optional)"))
+        layout.addWidget(
+            QLabel("School / Team Name (optional)")
+        )
 
         self.single_school = QLineEdit()
 
@@ -1390,13 +1723,8 @@ class RosterExtractorWindow(QMainWindow):
 
         layout.addWidget(self.single_season)
 
-        self.single_button = QPushButton(
-            "Extract Roster"
-        )
-
-        self.single_button.clicked.connect(
-            self.start_single
-        )
+        self.single_button = QPushButton("Extract Roster")
+        self.single_button.clicked.connect(self.start_single)
 
         layout.addWidget(self.single_button)
 
@@ -1405,13 +1733,10 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def build_batch_tab(self):
-
         layout = QVBoxLayout(self.batch_tab)
 
         layout.addWidget(
-            QLabel(
-                "Enter one roster URL per line."
-            )
+            QLabel("Enter one roster URL per line.")
         )
 
         self.batch_urls = QTextEdit()
@@ -1424,13 +1749,8 @@ class RosterExtractorWindow(QMainWindow):
 
         layout.addWidget(self.batch_urls)
 
-        self.batch_button = QPushButton(
-            "Process All Rosters"
-        )
-
-        self.batch_button.clicked.connect(
-            self.start_batch
-        )
+        self.batch_button = QPushButton("Process All Rosters")
+        self.batch_button.clicked.connect(self.start_batch)
 
         layout.addWidget(self.batch_button)
 
@@ -1439,11 +1759,9 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def build_library_tab(self):
-
         layout = QVBoxLayout(self.library_tab)
 
         self.library_table = QTableWidget()
-
         self.library_table.setColumnCount(6)
 
         self.library_table.setHorizontalHeaderLabels([
@@ -1463,21 +1781,11 @@ class RosterExtractorWindow(QMainWindow):
 
         buttons = QHBoxLayout()
 
-        refresh_button = QPushButton(
-            "Refresh Library"
-        )
+        refresh_button = QPushButton("Refresh Library")
+        refresh_button.clicked.connect(self.refresh_library)
 
-        refresh_button.clicked.connect(
-            self.refresh_library
-        )
-
-        load_button = QPushButton(
-            "Load Selected Roster"
-        )
-
-        load_button.clicked.connect(
-            self.load_selected_roster
-        )
+        load_button = QPushButton("Load Selected Roster")
+        load_button.clicked.connect(self.load_selected_roster)
 
         buttons.addWidget(refresh_button)
         buttons.addWidget(load_button)
@@ -1489,7 +1797,6 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def start_single(self):
-
         url = self.single_url.text().strip()
 
         if not url:
@@ -1509,7 +1816,6 @@ class RosterExtractorWindow(QMainWindow):
         self.start_worker([task])
 
     def start_batch(self):
-
         urls = [
             line.strip()
             for line in self.batch_urls.toPlainText().splitlines()
@@ -1536,26 +1842,22 @@ class RosterExtractorWindow(QMainWindow):
         self.start_worker(tasks)
 
     def start_worker(self, tasks):
-
         if self.worker and self.worker.isRunning():
             return
 
         self.current_players = []
+        self.result_fields = list(DISPLAY_FIELDS)
 
+        self.results_table.clear()
         self.results_table.setRowCount(0)
+        self.results_table.setColumnCount(len(DISPLAY_FIELDS))
+        self.results_table.setHorizontalHeaderLabels(DISPLAY_FIELDS)
 
         self.progress_bar.setVisible(True)
-
-        self.progress_bar.setRange(
-            0,
-            len(tasks)
-        )
-
+        self.progress_bar.setRange(0, len(tasks))
         self.progress_bar.setValue(0)
 
-        self.status_label.setText(
-            "Starting extraction..."
-        )
+        self.status_label.setText("Starting extraction...")
 
         self.set_actions_enabled(False)
 
@@ -1564,22 +1866,13 @@ class RosterExtractorWindow(QMainWindow):
 
         self.worker = ExtractionWorker(tasks)
 
-        self.worker.progress.connect(
-            self.on_progress
-        )
-
-        self.worker.completed.connect(
-            self.on_completed
-        )
-
-        self.worker.failed.connect(
-            self.on_failed
-        )
+        self.worker.progress.connect(self.on_progress)
+        self.worker.completed.connect(self.on_completed)
+        self.worker.failed.connect(self.on_failed)
 
         self.worker.start()
 
     def on_progress(self, current, total, url):
-
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
 
@@ -1588,7 +1881,6 @@ class RosterExtractorWindow(QMainWindow):
         )
 
     def on_completed(self, players, failures):
-
         self.current_players = players
 
         self.display_players(players)
@@ -1598,9 +1890,7 @@ class RosterExtractorWindow(QMainWindow):
         self.single_button.setDisabled(False)
         self.batch_button.setDisabled(False)
 
-        self.set_actions_enabled(
-            bool(players)
-        )
+        self.set_actions_enabled(bool(players))
 
         successful = len({
             player.get("source_url")
@@ -1616,7 +1906,6 @@ class RosterExtractorWindow(QMainWindow):
         self.status_label.setText(summary)
 
         if failures:
-
             details = "\n\n".join(
                 f"{item['url']}\n{item['error']}"
                 for item in failures
@@ -1627,9 +1916,7 @@ class RosterExtractorWindow(QMainWindow):
                 "Extraction Finished with Errors",
                 summary + "\n\n" + details
             )
-
         else:
-
             QMessageBox.information(
                 self,
                 "Extraction Complete",
@@ -1637,7 +1924,6 @@ class RosterExtractorWindow(QMainWindow):
             )
 
     def on_failed(self, error):
-
         self.progress_bar.setVisible(False)
 
         self.single_button.setDisabled(False)
@@ -1658,60 +1944,95 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def display_players(self, players):
-
         self.results_table.setSortingEnabled(False)
 
-        self.results_table.setRowCount(
-            len(players)
+        fields = list(DISPLAY_FIELDS)
+        custom_fields = []
+
+        for player in players:
+            for field_name in (
+                player.get("custom_fields") or {}
+            ):
+                if field_name not in custom_fields:
+                    custom_fields.append(field_name)
+
+        self.result_fields = fields + custom_fields
+
+        self.results_table.clear()
+        self.results_table.setColumnCount(
+            len(self.result_fields)
         )
 
+        self.results_table.setHorizontalHeaderLabels(
+            self.result_fields
+        )
+
+        self.results_table.setRowCount(len(players))
+
         for row, player in enumerate(players):
+            for column, field in enumerate(self.result_fields):
 
-            for column, field in enumerate(DISPLAY_FIELDS):
-
-                value = player.get(field, "")
+                if field in DISPLAY_FIELDS:
+                    value = player.get(field, "")
+                else:
+                    value = (
+                        player.get("custom_fields") or {}
+                    ).get(field, "")
 
                 if isinstance(value, list):
-                    value = "; ".join(value)
-
-                item = QTableWidgetItem(
-                    str(value)
-                )
+                    value = "; ".join(
+                        str(item) for item in value
+                    )
 
                 self.results_table.setItem(
                     row,
                     column,
-                    item
+                    QTableWidgetItem(str(value or ""))
                 )
 
-        self.results_table.setSortingEnabled(True)
+        self.results_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+
+        self.results_table.setAlternatingRowColors(True)
+
+        # Keep visual row order aligned with current_players.
+        self.results_table.setSortingEnabled(False)
 
     def read_results(self):
-
         records = []
+
+        fields = self.result_fields
 
         for row in range(self.results_table.rowCount()):
 
-            player = {}
+            if row < len(self.current_players):
+                player = dict(self.current_players[row])
+            else:
+                player = {}
 
-            for column, field in enumerate(DISPLAY_FIELDS):
+            custom_fields = dict(
+                player.get("custom_fields") or {}
+            )
 
-                item = self.results_table.item(
-                    row,
-                    column
-                )
+            for column, field in enumerate(fields):
+                item = self.results_table.item(row, column)
 
                 value = item.text() if item else ""
 
-                if field == "warnings":
+                if field in DISPLAY_FIELDS:
+                    if field == "warnings":
+                        value = [
+                            warning.strip()
+                            for warning in value.split(";")
+                            if warning.strip()
+                        ]
 
-                    value = [
-                        warning.strip()
-                        for warning in value.split(";")
-                        if warning.strip()
-                    ]
+                    player[field] = value
+                else:
+                    custom_fields[field] = value
 
-                player[field] = value
+            player["custom_fields"] = custom_fields
 
             first, last = split_name(
                 player.get("name", "")
@@ -1729,7 +2050,6 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def save_results(self):
-
         records = self.read_results()
 
         if not records:
@@ -1738,7 +2058,6 @@ class RosterExtractorWindow(QMainWindow):
         groups = {}
 
         for player in records:
-
             source = player.get("source_url", "")
 
             if not source:
@@ -1754,9 +2073,7 @@ class RosterExtractorWindow(QMainWindow):
         saved = 0
 
         try:
-
             for players in groups.values():
-
                 self.database.save_roster(players)
                 saved += 1
 
@@ -1770,7 +2087,6 @@ class RosterExtractorWindow(QMainWindow):
             )
 
         except Exception as error:
-
             QMessageBox.critical(
                 self,
                 "Database Error",
@@ -1782,7 +2098,6 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def export_json(self):
-
         records = self.read_results()
 
         if not records:
@@ -1796,13 +2111,8 @@ class RosterExtractorWindow(QMainWindow):
         )
 
         if path:
-
             try:
-
-                RosterExporter.export_json(
-                    records,
-                    path
-                )
+                RosterExporter.export_json(records, path)
 
                 QMessageBox.information(
                     self,
@@ -1811,7 +2121,6 @@ class RosterExtractorWindow(QMainWindow):
                 )
 
             except Exception as error:
-
                 QMessageBox.critical(
                     self,
                     "Export Error",
@@ -1819,7 +2128,6 @@ class RosterExtractorWindow(QMainWindow):
                 )
 
     def export_csv(self):
-
         records = self.read_results()
 
         if not records:
@@ -1833,13 +2141,8 @@ class RosterExtractorWindow(QMainWindow):
         )
 
         if path:
-
             try:
-
-                RosterExporter.export_csv(
-                    records,
-                    path
-                )
+                RosterExporter.export_csv(records, path)
 
                 QMessageBox.information(
                     self,
@@ -1848,7 +2151,6 @@ class RosterExtractorWindow(QMainWindow):
                 )
 
             except Exception as error:
-
                 QMessageBox.critical(
                     self,
                     "Export Error",
@@ -1860,15 +2162,11 @@ class RosterExtractorWindow(QMainWindow):
     # --------------------------------------------------------
 
     def refresh_library(self):
-
         rosters = self.database.get_rosters()
 
-        self.library_table.setRowCount(
-            len(rosters)
-        )
+        self.library_table.setRowCount(len(rosters))
 
         for row, roster in enumerate(rosters):
-
             values = [
                 roster["id"],
                 roster["school"],
@@ -1879,7 +2177,6 @@ class RosterExtractorWindow(QMainWindow):
             ]
 
             for column, value in enumerate(values):
-
                 self.library_table.setItem(
                     row,
                     column,
@@ -1887,13 +2184,15 @@ class RosterExtractorWindow(QMainWindow):
                 )
 
     def load_selected_roster(self):
-
         row = self.library_table.currentRow()
 
         if row < 0:
             return
 
         item = self.library_table.item(row, 0)
+
+        if not item:
+            return
 
         roster_id = int(item.text())
 
@@ -1904,21 +2203,27 @@ class RosterExtractorWindow(QMainWindow):
         players = []
 
         for record in database_players:
-
             player = dict(record)
 
             player.pop("id", None)
             player.pop("roster_id", None)
 
-            try:
+            for field in RosterDatabase.JSON_FIELDS:
+                raw_value = player.get(field)
 
-                player["warnings"] = json.loads(
-                    player.get("warnings", "[]")
-                )
+                try:
+                    if raw_value:
+                        player[field] = json.loads(raw_value)
+                    elif field in ("raw_fields", "custom_fields"):
+                        player[field] = {}
+                    else:
+                        player[field] = []
 
-            except json.JSONDecodeError:
-
-                player["warnings"] = []
+                except (json.JSONDecodeError, TypeError):
+                    if field in ("raw_fields", "custom_fields"):
+                        player[field] = {}
+                    else:
+                        player[field] = []
 
             players.append(player)
 
@@ -1932,36 +2237,32 @@ class RosterExtractorWindow(QMainWindow):
             f"Loaded {len(players)} saved player records."
         )
 
-        self.set_actions_enabled(
-            bool(players)
-        )
+        self.set_actions_enabled(bool(players))
 
     # --------------------------------------------------------
     # GENERAL INTERFACE
     # --------------------------------------------------------
 
     def set_actions_enabled(self, enabled):
-
         self.save_button.setEnabled(enabled)
         self.json_button.setEnabled(enabled)
         self.csv_button.setEnabled(enabled)
 
     def clear_results(self):
-
         self.current_players = []
+        self.result_fields = list(DISPLAY_FIELDS)
 
+        self.results_table.clear()
         self.results_table.setRowCount(0)
+        self.results_table.setColumnCount(len(DISPLAY_FIELDS))
+        self.results_table.setHorizontalHeaderLabels(DISPLAY_FIELDS)
 
-        self.status_label.setText(
-            "Results cleared."
-        )
+        self.status_label.setText("Results cleared.")
 
         self.set_actions_enabled(False)
 
     def closeEvent(self, event):
-
         if self.worker and self.worker.isRunning():
-
             QMessageBox.warning(
                 self,
                 "Extraction Running",
@@ -1972,7 +2273,6 @@ class RosterExtractorWindow(QMainWindow):
             return
 
         self.database.close()
-
         event.accept()
 
 

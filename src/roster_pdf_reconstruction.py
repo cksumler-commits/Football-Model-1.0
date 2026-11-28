@@ -1,21 +1,19 @@
-import math
+
 import re
 from statistics import median
 
+import pymupdf
+
 
 HEADER_TERMS = {
-    "number", "no", "jersey", "player", "name",
-    "position", "pos", "height", "ht",
-    "weight", "wt", "class", "classification",
-    "experience", "hometown", "home town",
-    "high school", "highschool", "previous school",
-    "major", "year",
+    "no", "number", "jersey", "player", "name", "position", "pos",
+    "height", "ht", "weight", "wt", "class", "year",
+    "experience", "hometown", "home town", "high school",
+    "highschool", "previous school", "school", "major",
 }
 
 
-def _get_word_geometry(word):
-    """Return normalized word geometry, or None if unavailable."""
-
+def _word_geometry(word):
     bbox = word.get("bbox")
 
     if not bbox or len(bbox) != 4:
@@ -26,16 +24,12 @@ def _get_word_geometry(word):
     except (TypeError, ValueError):
         return None
 
-    if x1 <= x0 or y1 <= y0:
-        return None
-
     text = str(word.get("text", "")).strip()
 
-    if not text:
+    if not text or x1 <= x0 or y1 <= y0:
         return None
 
     return {
-        "source": word,
         "text": text,
         "x0": x0,
         "y0": y0,
@@ -44,67 +38,50 @@ def _get_word_geometry(word):
         "cx": (x0 + x1) / 2,
         "cy": (y0 + y1) / 2,
         "height": y1 - y0,
+        "source": word,
     }
 
 
-def _get_record_words(record):
-    """Collect each source word once from a segmented record."""
+def _extract_page_words(page):
+    """Extract word-level text while retaining PDF coordinates."""
 
-    collected = []
-    seen = set()
+    extracted = []
 
-    for line in record.get("lines", []):
-        for word in line.get("words", []):
-            geometry = _get_word_geometry(word)
+    for item in page.get_text("words", sort=False):
+        if len(item) < 5:
+            continue
 
-            if geometry is None:
-                continue
+        x0, y0, x1, y1, text = item[:5]
 
-            # Word coordinates and extraction identifiers provide
-            # a stable key without requiring object identity.
-            key = (
-                word.get("block_number"),
-                word.get("line_number"),
-                word.get("word_number"),
-                tuple(round(value, 2) for value in geometry["source"]["bbox"]),
-                geometry["text"],
-            )
+        extracted.append({
+            "text": str(text),
+            "bbox": [x0, y0, x1, y1],
+            "block_number": item[5] if len(item) > 5 else None,
+            "line_number": item[6] if len(item) > 6 else None,
+            "word_number": item[7] if len(item) > 7 else None,
+        })
 
-            if key in seen:
-                continue
-
-            seen.add(key)
-            collected.append(geometry)
-
-    return collected
+    return extracted
 
 
-def _group_visual_rows(words, row_tolerance):
-    """
-    Group words by vertical position rather than relying on PDF
-    block/line identifiers, which can differ between columns.
-    """
+def _group_visual_rows(words, tolerance):
+    """Group words by their vertical positions, not PDF line IDs."""
 
     rows = []
 
-    for word in sorted(
-        words,
-        key=lambda item: (item["cy"], item["x0"]),
-    ):
+    for word in sorted(words, key=lambda item: (item["cy"], item["x0"])):
         best_row = None
         best_distance = None
 
         for row in rows:
-            row_center = sum(
-                item["cy"] for item in row
-            ) / len(row)
+            center = median(item["cy"] for item in row)
+            distance = abs(word["cy"] - center)
 
-            distance = abs(word["cy"] - row_center)
-
-            if distance <= row_tolerance:
-                if best_distance is None or distance < best_distance:
-                    best_row = row
-                    best_distance = distance
+            if distance <= tolerance and (
+                best_distance is None or distance < best_distance
+            ):
+                best_row = row
+                best_distance = distance
 
         if best_row is None:
             rows.append([word])
@@ -114,116 +91,53 @@ def _group_visual_rows(words, row_tolerance):
     for row in rows:
         row.sort(key=lambda item: item["x0"])
 
-    rows.sort(
-        key=lambda row: min(item["cy"] for item in row)
-    )
-
+    rows.sort(key=lambda row: median(item["cy"] for item in row))
     return rows
 
 
-def _cluster_column_starts(gap_candidates, tolerance, record_count):
-    """
-    Cluster recurring starts of text that follows a wide horizontal gap.
-
-    A candidate must recur across multiple player records. This helps
-    distinguish actual column starts from ordinary spaces between words.
-    """
+def _cluster_positions(candidates, tolerance, minimum_support):
+    """Cluster recurring x positions, counting support by distinct rows."""
 
     clusters = []
 
-    for candidate in sorted(
-        gap_candidates,
-        key=lambda item: item["right_x"],
-    ):
-        matching_cluster = None
+    for candidate in sorted(candidates, key=lambda item: item["x"]):
+        best_cluster = None
         best_distance = None
 
         for cluster in clusters:
-            center = median(
-                item["right_x"] for item in cluster
-            )
+            center = median(item["x"] for item in cluster)
+            distance = abs(candidate["x"] - center)
 
-            distance = abs(candidate["right_x"] - center)
+            if distance <= tolerance and (
+                best_distance is None or distance < best_distance
+            ):
+                best_cluster = cluster
+                best_distance = distance
 
-            if distance <= tolerance:
-                if best_distance is None or distance < best_distance:
-                    matching_cluster = cluster
-                    best_distance = distance
-
-        if matching_cluster is None:
+        if best_cluster is None:
             clusters.append([candidate])
         else:
-            matching_cluster.append(candidate)
-
-    minimum_support = max(
-        2,
-        math.ceil(record_count * 0.25),
-    )
+            best_cluster.append(candidate)
 
     accepted = []
 
     for cluster in clusters:
-        supporting_records = {
-            item["record_index"]
-            for item in cluster
-        }
+        row_ids = {item["row"] for item in cluster}
 
-        if len(supporting_records) < minimum_support:
-            continue
-
-        accepted.append({
-            "x": median(
-                item["right_x"] for item in cluster
-            ),
-            "record_support": len(supporting_records),
-            "gap_count": len(cluster),
-            "median_gap_width": median(
-                item["gap_width"] for item in cluster
-            ),
-        })
+        if len(row_ids) >= minimum_support:
+            accepted.append({
+                "x": median(item["x"] for item in cluster),
+                "row_support": len(row_ids),
+                "observations": len(cluster),
+            })
 
     accepted.sort(key=lambda item: item["x"])
-
-    # Avoid treating two nearly identical clusters as separate columns.
-    merged = []
-
-    for cluster in accepted:
-        if (
-            merged
-            and abs(cluster["x"] - merged[-1]["x"])
-            <= tolerance
-        ):
-            previous = merged[-1]
-
-            previous["x"] = median([
-                previous["x"],
-                cluster["x"],
-            ])
-
-            previous["record_support"] = max(
-                previous["record_support"],
-                cluster["record_support"],
-            )
-
-            previous["gap_count"] += cluster["gap_count"]
-
-            previous["median_gap_width"] = median([
-                previous["median_gap_width"],
-                cluster["median_gap_width"],
-            ])
-        else:
-            merged.append(cluster.copy())
-
-    return merged
+    return accepted
 
 
-def _is_header_candidate(value):
-    """Flag likely column headings without deleting their source text."""
-
+def _is_header_text(text):
     normalized = re.sub(
-        r"[^a-z0-9]+",
-        " ",
-        str(value or "").casefold(),
+        r"[^a-z0-9]+", " ", str(text).casefold()
     ).strip()
 
     if not normalized:
@@ -237,331 +151,383 @@ def _is_header_candidate(value):
         for term in (
             "high school",
             "previous school",
-            "classification",
             "hometown",
             "home town",
+            "classification",
         )
     )
 
 
-def reconstruct_pdf_roster_cells(records, layout_result=None):
+def _row_text(row):
+    return " ".join(word["text"] for word in row).strip()
+
+
+def _detect_columns(rows, median_height):
     """
-    Reconstruct spatially aligned cells from segmented PDF records.
+    Detect recurring cell starts from large horizontal gaps.
 
-    For table-like layouts, recurring wide gaps across multiple records
-    are used to identify likely column starts.
-
-    For card-like or uncertain layouts, the function preserves visual
-    rows without forcing a table structure.
-
-    No fixed PDF coordinates or school-specific assumptions are used.
-    Original source words and bounding boxes are retained.
+    The positions are inferred independently for each document/page.
+    No school-specific coordinates or fixed column layouts are used.
     """
 
-    layout_result = layout_result or {}
+    gap_threshold = max(5.0, median_height * 1.35)
+    position_tolerance = max(5.0, median_height * 1.5)
 
-    layout_type = layout_result.get(
-        "layout_type",
-        "unclassified",
+    candidates = []
+
+    for row_index, row in enumerate(rows):
+        for left, right in zip(row, row[1:]):
+            gap = right["x0"] - left["x1"]
+
+            if gap >= gap_threshold:
+                candidates.append({
+                    "x": right["x0"],
+                    "row": row_index,
+                    "gap": gap,
+                })
+
+    minimum_support = max(2, round(len(rows) * 0.20))
+
+    clusters = _cluster_positions(
+        candidates,
+        position_tolerance,
+        minimum_support,
     )
 
-    table_like_layouts = {
-        "traditional_table",
-        "multi_column_roster",
-        "single_column_roster",
-    }
+    return clusters, gap_threshold, position_tolerance
 
-    use_column_inference = layout_type in table_like_layouts
 
-    prepared_records = []
-    all_heights = []
+def _split_row_into_cells(row, column_starts, gap_threshold,
+                          position_tolerance):
+    cells = []
 
-    # --------------------------------------------------
-    # 1. Prepare words and visual rows for each record.
-    # --------------------------------------------------
+    for word in row:
+        target_column = 0
 
-    for record_index, record in enumerate(records):
-        words = _get_record_words(record)
+        for index, boundary in enumerate(column_starts):
+            if (
+                word["x0"] >= boundary["x"] - position_tolerance
+            ):
+                target_column = index + 1
 
-        if not words:
-            prepared_records.append({
-                "record": record,
-                "record_index": record_index,
+        while len(cells) <= target_column:
+            cells.append([])
+
+        cells[target_column].append(word)
+
+    result = []
+
+    for index, cell_words in enumerate(cells):
+        if not cell_words:
+            result.append({
+                "column_index": index,
+                "text": "",
                 "words": [],
-                "rows": [],
+                "bbox": None,
             })
             continue
 
-        all_heights.extend(
-            word["height"] for word in words
-        )
+        cell_words.sort(key=lambda item: item["x0"])
 
-        prepared_records.append({
-            "record": record,
-            "record_index": record_index,
-            "words": words,
+        result.append({
+            "column_index": index,
+            "text": " ".join(item["text"] for item in cell_words),
+            "words": [item["source"] for item in cell_words],
+            "bbox": [
+                min(item["x0"] for item in cell_words),
+                min(item["y0"] for item in cell_words),
+                max(item["x1"] for item in cell_words),
+                max(item["y1"] for item in cell_words),
+            ],
         })
 
-    if not all_heights:
+    return result
+
+
+def _reconstruct_page(page_number, source_words):
+    geometries = [
+        item for item in
+        (_word_geometry(word) for word in source_words)
+        if item is not None
+    ]
+
+    if not geometries:
         return {
+            "page_number": page_number,
+            "source_words": source_words,
+            "rows": [],
             "records": [],
-            "column_starts": [],
+            "columns": [],
+            "unassigned_text": "",
             "diagnostics": {
-                "layout_type": layout_type,
-                "record_count": len(records),
+                "word_count": 0,
+                "row_count": 0,
+                "record_count": 0,
                 "column_count": 0,
-                "reason": "No usable source-word geometry was found.",
+                "reason": "No usable word geometry was extracted.",
             },
         }
 
-    median_height = median(all_heights)
+    median_height = median(item["height"] for item in geometries)
+    row_tolerance = max(2.0, median_height * 0.65)
 
-    row_tolerance = max(
-        2.0,
-        median_height * 0.65,
+    rows = _group_visual_rows(geometries, row_tolerance)
+
+    column_starts, gap_threshold, position_tolerance = (
+        _detect_columns(rows, median_height)
     )
 
-    for prepared in prepared_records:
-        prepared["rows"] = _group_visual_rows(
-            prepared["words"],
-            row_tolerance,
+    reconstructed_rows = []
+    records = []
+    unassigned_rows = []
+
+    for row_index, row in enumerate(rows):
+        cells = _split_row_into_cells(
+            row,
+            column_starts,
+            gap_threshold,
+            position_tolerance,
         )
 
-    # --------------------------------------------------
-    # 2. Find recurring horizontal column starts.
-    # --------------------------------------------------
+        text = _row_text(row)
+        nonempty_cells = [cell for cell in cells if cell["text"]]
 
-    gap_threshold = max(
-        3.0,
-        median_height * 1.20,
-    )
+        header_hits = sum(
+            1 for cell in nonempty_cells
+            if _is_header_text(cell["text"])
+        )
 
-    gap_candidates = []
-
-    if use_column_inference:
-        for prepared in prepared_records:
-            record_index = prepared["record_index"]
-
-            for row_index, row in enumerate(prepared["rows"]):
-                for left_word, right_word in zip(row, row[1:]):
-                    gap_width = (
-                        right_word["x0"] - left_word["x1"]
-                    )
-
-                    if gap_width < gap_threshold:
-                        continue
-
-                    gap_candidates.append({
-                        "record_index": record_index,
-                        "row_index": row_index,
-                        "right_x": right_word["x0"],
-                        "gap_width": gap_width,
-                    })
-
-    column_tolerance = max(
-        5.0,
-        median_height * 1.25,
-    )
-
-    column_starts = _cluster_column_starts(
-        gap_candidates,
-        column_tolerance,
-        len(records),
-    )
-
-    column_positions = [
-        item["x"] for item in column_starts
-    ]
-
-    # --------------------------------------------------
-    # 3. Split each visual row using the inferred starts.
-    # --------------------------------------------------
-
-    reconstructed_records = []
-
-    for prepared in prepared_records:
-        original_record = prepared["record"]
-
-        cells_by_column = {}
-
-        for row_index, row in enumerate(prepared["rows"]):
-            current_column = 0
-            current_words = []
-
-            for word_index, word in enumerate(row):
-                if word_index > 0 and column_positions:
-                    previous_word = row[word_index - 1]
-
-                    gap_width = (
-                        word["x0"] - previous_word["x1"]
-                    )
-
-                    if gap_width >= gap_threshold:
-                        matching_starts = [
-                            (index + 1, start_x)
-                            for index, start_x in enumerate(column_positions)
-                            if abs(word["x0"] - start_x) <= column_tolerance
-                        ]
-
-                        if matching_starts:
-                            current_column = min(
-                                matching_starts,
-                                key=lambda item: abs(
-                                    word["x0"] - item[1]
-                                ),
-                            )[0]
-
-                cells_by_column.setdefault(
-                    current_column,
-                    [],
-                ).append({
-                    "row_index": row_index,
-                    "word": word,
-                })
-
-        # --------------------------------------------------
-        # 4. Reconstruct cell text and preserve provenance.
-        # --------------------------------------------------
-
-        reconstructed_cells = []
-
-        for column_index in sorted(cells_by_column):
-            entries = cells_by_column[column_index]
-
-            row_groups = {}
-
-            for entry in entries:
-                row_groups.setdefault(
-                    entry["row_index"],
-                    [],
-                ).append(entry["word"])
-
-            cell_lines = []
-
-            for row_index in sorted(row_groups):
-                line_words = sorted(
-                    row_groups[row_index],
-                    key=lambda item: item["x0"],
-                )
-
-                line_text = " ".join(
-                    item["text"] for item in line_words
-                ).strip()
-
-                if not line_text:
-                    continue
-
-                cell_lines.append({
-                    "row_index": row_index,
-                    "text": line_text,
-                    "words": [
-                        item["source"] for item in line_words
-                    ],
-                })
-
-            cell_text = "\n".join(
-                line["text"] for line in cell_lines
+        is_header = (
+            header_hits >= 2
+            or (
+                len(nonempty_cells) == 1
+                and _is_header_text(text)
             )
+        )
 
-            source_words = [
-                word
-                for line in cell_lines
-                for word in line["words"]
-            ]
+        bbox = [
+            min(word["x0"] for word in row),
+            min(word["y0"] for word in row),
+            max(word["x1"] for word in row),
+            max(word["y1"] for word in row),
+        ]
 
-            geometries = [
-                _get_word_geometry(word)
-                for word in source_words
-            ]
+        row_result = {
+            "row_index": row_index,
+            "text": text,
+            "cells": cells,
+            "bbox": bbox,
+            "word_count": len(row),
+            "is_header_candidate": is_header,
+            "source_words": [word["source"] for word in row],
+        }
 
-            geometries = [
-                item for item in geometries
-                if item is not None
-            ]
+        reconstructed_rows.append(row_result)
 
-            if geometries:
-                cell_bbox = [
-                    min(item["x0"] for item in geometries),
-                    min(item["y0"] for item in geometries),
-                    max(item["x1"] for item in geometries),
-                    max(item["y1"] for item in geometries),
-                ]
-            else:
-                cell_bbox = None
+        if is_header:
+            unassigned_rows.append(text)
+            continue
 
-            reconstructed_cells.append({
-                "cell_id": (
-                    f"{original_record.get('record_id', 'record')}"
-                    f"_column_{column_index + 1}"
+        # Preserve every non-header visual row as a candidate.
+        # No jersey-number anchor is required.
+        if text:
+            records.append({
+                "record_id": f"page_{page_number}_row_{row_index + 1}",
+                "page_number": page_number,
+                "row_index": row_index,
+                "text": text,
+                "cells": cells,
+                "bbox": bbox,
+                "word_count": len(row),
+                "source_words": [word["source"] for word in row],
+                "confidence": (
+                    "medium" if len(nonempty_cells) >= 2 else "low"
                 ),
-                "column_index": column_index,
-                "text": cell_text,
-                "lines": cell_lines,
-                "bbox": cell_bbox,
-                "word_count": len(source_words),
-                "is_header_candidate": _is_header_candidate(
-                    cell_text
-                ),
+                "review_required": len(nonempty_cells) < 2,
             })
 
-        # --------------------------------------------------
-        # 5. Build semantic input without discarding geometry.
-        # --------------------------------------------------
-
-        semantic_lines = []
-
-        for cell in reconstructed_cells:
-            for line in cell["lines"]:
-                semantic_lines.append({
-                    "text": line["text"],
-                    "words": line["words"],
-                    "cell_index": cell["column_index"],
-                    "cell_id": cell["cell_id"],
-                    "cell_bbox": cell["bbox"],
-                    "is_header_candidate": (
-                        cell["is_header_candidate"]
-                    ),
-                })
-
-        reconstructed_records.append({
-            **original_record,
-            "cells": reconstructed_cells,
-            "lines": semantic_lines,
-        })
-
-    # --------------------------------------------------
-    # 6. Summarize the inferred structure.
-    # --------------------------------------------------
-
-    column_count = (
-        len(column_positions) + 1
-        if column_positions
-        else 0
-    )
-
-    diagnostics = {
-        "layout_type": layout_type,
-        "record_count": len(reconstructed_records),
-        "column_count": column_count,
-        "column_start_positions": [
-            round(value, 2)
-            for value in column_positions
-        ],
-        "column_evidence": column_starts,
-        "median_text_height": round(median_height, 2),
-        "gap_threshold": round(gap_threshold, 2),
-        "used_column_inference": use_column_inference,
-        "reason": (
-            "Recurring horizontal gaps were used to infer columns."
-            if column_positions
-            else
-            "No recurring column boundaries met the evidence threshold; "
-            "visual rows were preserved without forced column splitting."
-        ),
-    }
+    # A column count is based on observed recurring boundaries.
+    column_count = len(column_starts) + 1 if rows else 0
 
     return {
-        "records": reconstructed_records,
-        "column_starts": column_starts,
-        "diagnostics": diagnostics,
+        "page_number": page_number,
+        "source_words": source_words,
+        "rows": reconstructed_rows,
+        "records": records,
+        "columns": column_starts,
+        "unassigned_text": "\n".join(unassigned_rows),
+        "diagnostics": {
+            "word_count": len(geometries),
+            "row_count": len(rows),
+            "record_count": len(records),
+            "column_count": column_count,
+            "median_text_height": round(median_height, 2),
+            "row_tolerance": round(row_tolerance, 2),
+            "gap_threshold": round(gap_threshold, 2),
+            "column_boundaries": column_starts,
+            "reason": (
+                "Rows and recurring column starts were inferred "
+                "from word geometry."
+                if column_starts
+                else
+                "Rows were reconstructed, but recurring column "
+                "boundaries were not sufficiently supported."
+            ),
+        },
+    }
+
+
+def analyze_roster_pdf(pdf_path):
+    """
+    Analyze every page in a PDF without requiring manual region selection.
+
+    Returns page-level rows, candidate records, inferred columns,
+    source words, and diagnostics. All extracted words remain traceable.
+    """
+
+    pages = []
+
+    with pymupdf.open(pdf_path) as document:
+        for page_index, page in enumerate(document):
+            source_words = _extract_page_words(page)
+
+            pages.append(
+                _reconstruct_page(page_index + 1, source_words)
+            )
+
+    all_records = [
+        record
+        for page in pages
+        for record in page["records"]
+    ]
+
+    all_unassigned = [
+        {
+            "page_number": page["page_number"],
+            "text": page["unassigned_text"],
+        }
+        for page in pages
+        if page["unassigned_text"].strip()
+    ]
+
+    total_words = sum(
+        page["diagnostics"]["word_count"] for page in pages
+    )
+
+    return {
+        "pdf_path": str(pdf_path),
+        "page_count": len(pages),
+        "pages": pages,
+        "records": all_records,
+        "unassigned_content": all_unassigned,
+        "diagnostics": {
+            "total_words": total_words,
+            "total_candidate_records": len(all_records),
+            "pages_with_records": sum(
+                bool(page["records"]) for page in pages
+            ),
+            "message": (
+                "Automatic full-document reconstruction completed. "
+                "Candidate rows are not yet confirmed player records."
+            ),
+        },
+    }
+
+
+def recover_selected_region(source_words, selection_bbox, page_number):
+    """
+    Reconstruct a selected region as supplemental recovery data.
+
+    This does not replace or erase the automatic page analysis.
+    """
+
+    x0, y0, x1, y1 = map(float, selection_bbox)
+
+    selected = []
+
+    for word in source_words:
+        geometry = _word_geometry(word)
+
+        if geometry is None:
+            continue
+
+        intersects = not (
+            geometry["x1"] <= x0
+            or geometry["x0"] >= x1
+            or geometry["y1"] <= y0
+            or geometry["y0"] >= y1
+        )
+
+        if intersects:
+            selected.append(word)
+
+    reconstructed = _reconstruct_page(page_number, selected)
+
+    reconstructed["recovery_region"] = list(selection_bbox)
+    reconstructed["is_recovery_result"] = True
+
+    return reconstructed
+
+
+# Backward-compatible wrapper for the previous selected-record workflow.
+def reconstruct_pdf_roster_cells(records, layout_result=None):
+    reconstructed = []
+
+    for record_index, record in enumerate(records):
+        source_words = []
+
+        for line in record.get("lines", []):
+            source_words.extend(line.get("words", []))
+
+        geometries = [
+            item for item in
+            (_word_geometry(word) for word in source_words)
+            if item is not None
+        ]
+
+        if not geometries:
+            reconstructed.append({
+                **record,
+                "cells": [],
+            })
+            continue
+
+        median_height = median(item["height"] for item in geometries)
+        rows = _group_visual_rows(
+            geometries,
+            max(2.0, median_height * 0.65),
+        )
+
+        boundaries, gap_threshold, tolerance = _detect_columns(
+            rows,
+            median_height,
+        )
+
+        cells = []
+
+        for row in rows:
+            row_cells = _split_row_into_cells(
+                row, boundaries, gap_threshold, tolerance
+            )
+            cells.extend(row_cells)
+
+        reconstructed.append({
+            **record,
+            "cells": cells,
+        })
+
+    return {
+        "records": reconstructed,
+        "column_starts": [],
+        "diagnostics": {
+            "layout_type": (layout_result or {}).get(
+                "layout_type", "unclassified"
+            ),
+            "record_count": len(reconstructed),
+            "column_count": 0,
+            "reason": (
+                "Backward-compatible reconstruction. "
+                "Use analyze_roster_pdf() for full-document analysis."
+            ),
+        },
     }

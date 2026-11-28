@@ -53,6 +53,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRectF
 import re
 
 from roster_pdf_reconstruction import reconstruct_pdf_roster_cells
+from roster_pdf_reconstruction import reconstruct_pdf_roster_cells
 
 
 def classify_roster_layout(words, selection_bbox):
@@ -2794,8 +2795,9 @@ class SelectableGraphicsView(QGraphicsView):
 
 
 
+
 class PDFVisualInspector(QDialog):
-    """Display PDF pages, detected structures, and selected-region text."""
+    """Automatic full-document roster reconstruction with manual recovery."""
 
     RENDER_SCALE = 1.5
 
@@ -2810,27 +2812,27 @@ class PDFVisualInspector(QDialog):
     def __init__(self, analysis_results, parent=None):
         super().__init__(parent)
 
+        from roster_pdf_reconstruction import analyze_roster_pdf
+
+        self.analyze_roster_pdf = analyze_roster_pdf
         self.analysis_results = analysis_results
+
         self.current_path = None
         self.current_page_number = None
-
-        # Original word-level extraction data for the current page.
         self.current_page_words = []
 
-        # Structured information from the most recent selection.
-        self.selected_region_data = None
+        self.roster_results = {}
+        self.recovery_results = []
 
-        self.setWindowTitle("PDF Visual Inspector")
-        self.resize(1250, 950)
+        self.setWindowTitle("PDF Visual Inspector — Automatic Roster Analysis")
+        self.resize(1450, 950)
 
         self.setup_ui()
 
     def setup_ui(self):
-        layout = QVBoxLayout(self)
+        from PySide6.QtWidgets import QSplitter, QHeaderView
 
-        # --------------------------------------------------
-        # DOCUMENT AND PAGE CONTROLS
-        # --------------------------------------------------
+        layout = QVBoxLayout(self)
 
         controls = QHBoxLayout()
 
@@ -2846,17 +2848,23 @@ class PDFVisualInspector(QDialog):
         self.page_selector.setMinimum(1)
         self.page_selector.setMaximum(1)
 
+        self.select_region_button = QPushButton("Select Recovery Region")
+        self.select_region_button.setCheckable(True)
+
+        self.document_status_label = QLabel(
+            "Automatic analysis will run when a document is opened."
+        )
+
         controls.addWidget(QLabel("Document:"))
         controls.addWidget(self.document_selector, stretch=1)
         controls.addWidget(QLabel("Page:"))
         controls.addWidget(self.page_selector)
+        controls.addWidget(self.select_region_button)
 
-        # --------------------------------------------------
-        # PDF VIEWER
-        # --------------------------------------------------
+        layout.addLayout(controls)
+        layout.addWidget(self.document_status_label)
 
         self.scene = QGraphicsScene(self)
-
         self.page_view = SelectableGraphicsView(self.scene)
 
         self.page_view.region_selected.connect(
@@ -2872,67 +2880,24 @@ class PDFVisualInspector(QDialog):
             QGraphicsView.DragMode.ScrollHandDrag
         )
 
-        # --------------------------------------------------
-        # REGION SELECTION
-        # --------------------------------------------------
-
-        self.select_region_button = QPushButton(
-            "Select Region"
-        )
-
-        self.select_region_button.setCheckable(True)
-
         self.select_region_button.toggled.connect(
             self.page_view.set_selection_mode
         )
 
-        controls.addWidget(self.select_region_button)
-
-        layout.addLayout(controls)
-
-        # --------------------------------------------------
-        # DETECTION LEGEND
-        # --------------------------------------------------
-
-        self.legend_label = QLabel(
-            "Green: Tables | Blue: Containers | "
-            "Orange: Separator regions | "
-            "Purple: Text regions | Red: Unassigned text"
-        )
-
-        layout.addWidget(self.legend_label)
-
-        self.region_info_label = QLabel(
-            "Select a region to reconstruct its roster fields."
-        )
-
-        layout.addWidget(self.region_info_label)
-
-        # --------------------------------------------------
-        # SIDE-BY-SIDE WORKSPACE
-        # --------------------------------------------------
-
-        from PySide6.QtWidgets import QSplitter, QHeaderView
-
-        self.workspace_splitter = QSplitter(
-            Qt.Orientation.Horizontal
-        )
-
-        # Left: PDF viewer.
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.workspace_splitter.addWidget(self.page_view)
 
-        # Right: reconstructed roster and unassigned content.
         self.results_panel = QWidget()
         results_layout = QVBoxLayout(self.results_panel)
         results_layout.setContentsMargins(6, 6, 6, 6)
 
-        roster_heading = QLabel("Automatically Reconstructed Roster")
-        results_layout.addWidget(roster_heading)
-
-        self.column_info_label = QLabel(
-            "Select a PDF region to detect roster fields."
+        results_layout.addWidget(
+            QLabel("Automatic Candidate Rows")
         )
 
+        self.column_info_label = QLabel(
+            "Open a document to begin full-document analysis."
+        )
         self.column_info_label.setWordWrap(True)
         results_layout.addWidget(self.column_info_label)
 
@@ -2954,17 +2919,15 @@ class PDFVisualInspector(QDialog):
 
         results_layout.addWidget(self.roster_table, stretch=3)
 
-        unassigned_heading = QLabel(
-            "Unassigned / Uncertain Content"
+        results_layout.addWidget(
+            QLabel("Unassigned / Review Content")
         )
-
-        results_layout.addWidget(unassigned_heading)
 
         self.unassigned_output = QPlainTextEdit()
         self.unassigned_output.setReadOnly(True)
         self.unassigned_output.setPlaceholderText(
-            "Content that could not be confidently assigned "
-            "to a roster field will appear here."
+            "Headers, uncertain content, and supplemental "
+            "recovery results will appear here."
         )
 
         results_layout.addWidget(
@@ -2972,22 +2935,12 @@ class PDFVisualInspector(QDialog):
             stretch=1,
         )
 
-        self.workspace_splitter.addWidget(
-            self.results_panel
-        )
-
+        self.workspace_splitter.addWidget(self.results_panel)
         self.workspace_splitter.setStretchFactor(0, 1)
         self.workspace_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.setSizes([600, 600])
+        self.workspace_splitter.setSizes([650, 800])
 
-        layout.addWidget(
-            self.workspace_splitter,
-            stretch=1,
-        )
-
-        # --------------------------------------------------
-        # SIGNALS
-        # --------------------------------------------------
+        layout.addWidget(self.workspace_splitter, stretch=1)
 
         self.document_selector.currentIndexChanged.connect(
             self.load_document
@@ -2997,30 +2950,14 @@ class PDFVisualInspector(QDialog):
             self.load_page
         )
 
-        # --------------------------------------------------
-        # INITIAL DOCUMENT
-        # --------------------------------------------------
-
         if self.document_selector.count():
             self.load_document(0)
 
     def showEvent(self, event):
-        """Fit the PDF after the dialog becomes visible."""
-
         super().showEvent(event)
-
-        QTimer.singleShot(
-            0,
-            self.fit_page_to_view,
-        )
-
-    # ======================================================
-    # PAGE DISPLAY
-    # ======================================================
+        QTimer.singleShot(0, self.fit_page_to_view)
 
     def fit_page_to_view(self):
-        """Fit the current PDF page inside the available viewport."""
-
         scene_rect = self.scene.sceneRect()
 
         if scene_rect.isNull() or scene_rect.isEmpty():
@@ -3040,25 +2977,51 @@ class PDFVisualInspector(QDialog):
         if not path:
             return
 
-        result = self.analysis_results.get(path)
-
-        if not result:
-            return
-
         self.current_path = path
 
-        page_count = result.get("page_count", 0)
+        # Analyze once per document during this inspector session.
+        if path not in self.roster_results:
+            self.document_status_label.setText(
+                f"Automatically analyzing all pages in {Path(path).name}..."
+            )
+            QApplication.processEvents()
+
+            try:
+                result = self.analyze_roster_pdf(path)
+                self.roster_results[path] = result
+
+            except Exception as error:
+                self.roster_results[path] = {
+                    "pages": [],
+                    "records": [],
+                    "diagnostics": {
+                        "message": f"Automatic analysis failed: {error}"
+                    },
+                }
+
+                QMessageBox.critical(
+                    self,
+                    "Automatic Roster Analysis Error",
+                    str(error),
+                )
+
+        roster_result = self.roster_results[path]
+        page_count = roster_result.get("page_count", 0)
 
         self.page_selector.blockSignals(True)
-
-        self.page_selector.setRange(
-            1,
-            max(1, page_count),
-        )
-
+        self.page_selector.setRange(1, max(1, page_count))
         self.page_selector.setValue(1)
-
         self.page_selector.blockSignals(False)
+
+        diagnostics = roster_result.get("diagnostics", {})
+
+        self.document_status_label.setText(
+            f"Automatic analysis complete | "
+            f"{page_count} pages | "
+            f"{diagnostics.get('total_candidate_records', 0)} "
+            f"candidate rows | "
+            f"{diagnostics.get('total_words', 0)} extracted words"
+        )
 
         self.load_page(1)
 
@@ -3066,26 +3029,18 @@ class PDFVisualInspector(QDialog):
         if not self.current_path:
             return
 
-        result = self.analysis_results.get(
-            self.current_path
+        roster_result = self.roster_results.get(
+            self.current_path, {}
         )
 
-        if not result:
-            return
-
-        pages = result.get("pages", [])
+        pages = roster_result.get("pages", [])
 
         if not 1 <= page_number <= len(pages):
             return
 
         try:
             with pymupdf.open(self.current_path) as document:
-
                 pdf_page = document[page_number - 1]
-
-                # ------------------------------------------
-                # RENDER PDF PAGE
-                # ------------------------------------------
 
                 pixmap = pdf_page.get_pixmap(
                     matrix=pymupdf.Matrix(
@@ -3103,58 +3058,28 @@ class PDFVisualInspector(QDialog):
                         "Could not render the selected PDF page."
                     )
 
-                # ------------------------------------------
-                # EXTRACT ORIGINAL WORD DATA
-                # ------------------------------------------
-
-                self.current_page_words = extract_page_words(
-                    pdf_page
-                )
+                self.current_page_words = pages[
+                    page_number - 1
+                ].get("source_words", [])
 
                 self.current_page_number = page_number
 
-                # ------------------------------------------
-                # RESET PREVIOUS SELECTION
-                # ------------------------------------------
-
                 self.page_view.reset_selection()
-
                 self.select_region_button.setChecked(False)
-
-                self.selected_region_data = None
-
-                self.region_info_label.setText(
-                    "Select a region to extract its text."
-                )
-
-                self.roster_table.clear()
-                self.roster_table.setRowCount(0)
-                self.roster_table.setColumnCount(0)
-
-                self.unassigned_output.clear()
-
-                self.column_info_label.setText(
-                    "Select a region to detect roster fields."
-                )
-
-                # ------------------------------------------
-                # REBUILD SCENE
-                # ------------------------------------------
 
                 self.scene.clear()
 
                 page_item = self.scene.addPixmap(image)
+                page_item.setScale(1.0 / self.RENDER_SCALE)
 
-                # Convert rendered pixels back into PDF-point
-                # coordinates so overlays match analyzer bboxes.
+                structural_pages = self.analysis_results.get(
+                    self.current_path, {}
+                ).get("pages", [])
 
-                page_item.setScale(
-                    1.0 / self.RENDER_SCALE
-                )
-
-                self.draw_overlays(
-                    pages[page_number - 1]
-                )
+                if page_number <= len(structural_pages):
+                    self.draw_overlays(
+                        structural_pages[page_number - 1]
+                    )
 
                 self.scene.setSceneRect(
                     page_item.sceneBoundingRect()
@@ -3165,11 +3090,7 @@ class PDFVisualInspector(QDialog):
                     Qt.AspectRatioMode.KeepAspectRatio,
                 )
 
-                self.legend_label.setText(
-                    "Green: Tables | Blue: Containers | "
-                    "Orange: Separator regions | "
-                    "Purple: Text regions | Red: Unassigned text"
-                )
+                self.display_page_results(page_number)
 
         except Exception as error:
             QMessageBox.critical(
@@ -3178,263 +3099,64 @@ class PDFVisualInspector(QDialog):
                 str(error),
             )
 
-    # ======================================================
-    # MANUAL REGION EXTRACTION
-    # ======================================================
-
-    def handle_region_selected(self, rectangle):
-        """
-        Extract a selected PDF region and reconstruct its roster data.
-
-        Original extracted words remain available for later review,
-        layout analysis, record segmentation, and semantic mapping.
-        """
-
-        selection_bbox = [
-            rectangle.left(),
-            rectangle.top(),
-            rectangle.right(),
-            rectangle.bottom(),
-        ]
-
-        sx0, sy0, sx1, sy1 = selection_bbox
-
-        selected_words = []
-
-    # --------------------------------------------------
-    # 1. Extract words intersecting the selected region.
-    # --------------------------------------------------
-
-        for word in self.current_page_words:
-            bbox = word.get("bbox")
-
-            if not bbox or len(bbox) != 4:
-                continue
-
-            try:
-                x0, y0, x1, y1 = map(float, bbox)
-            except (TypeError, ValueError):
-                continue
-
-            intersects = not (
-                x1 <= sx0
-                or x0 >= sx1
-                or y1 <= sy0
-                or y0 >= sy1
-            )
-
-            if intersects:
-                selected_words.append(word)
-
-    # --------------------------------------------------
-    # 2. Preserve and reconstruct the original text.
-    # --------------------------------------------------
-
-        line_groups = {}
-
-        for word in selected_words:
-            line_key = (
-                word.get("block_number"),
-                word.get("line_number"),
-            )
-
-            line_groups.setdefault(line_key, []).append(word)
-
-        reconstructed_lines = []
-
-        for line_key, line_words in line_groups.items():
-            line_words.sort(
-                key=lambda item: item.get("word_number", 0)
-            )
-
-            reconstructed_lines.append({
-                "block_number": line_key[0],
-                "line_number": line_key[1],
-                "text": " ".join(
-                    item["text"] for item in line_words
-                ),
-                "words": line_words,
-                "y": min(
-                    item["bbox"][1] for item in line_words
-                ),
-                "x": min(
-                    item["bbox"][0] for item in line_words
-                ),
-            })
-
-        reconstructed_lines.sort(
-            key=lambda item: (item["y"], item["x"])
+    def display_page_results(self, page_number):
+        roster_result = self.roster_results.get(
+            self.current_path, {}
         )
 
-        extracted_text = "\n".join(
-            line["text"] for line in reconstructed_lines
+        pages = roster_result.get("pages", [])
+
+        if not 1 <= page_number <= len(pages):
+            return
+
+        page_data = pages[page_number - 1]
+        records = page_data.get("records", [])
+        diagnostics = page_data.get("diagnostics", {})
+
+        maximum_columns = max(
+            (
+                len(record.get("cells", []))
+                for record in records
+            ),
+            default=0,
         )
 
-        self.selected_region_data = {
-            "file_path": self.current_path,
-            "page_number": self.current_page_number,
-            "selection_bbox": selection_bbox,
-            "word_count": len(selected_words),
-            "line_count": len(reconstructed_lines),
-            "text": extracted_text,
-            "words": selected_words,
-            "lines": reconstructed_lines,
-     }
+        headers = ["Page", "Visual Row", "Confidence"]
 
-    # --------------------------------------------------
-    # 3. Classify the selected region's layout.
-    # --------------------------------------------------
-
-        layout_result = classify_roster_layout(
-            selected_words,
-            selection_bbox,
+        headers.extend(
+            f"Source Column {index + 1}"
+            for index in range(maximum_columns)
         )
-
-        self.selected_region_data["layout_analysis"] = (
-            layout_result
-        )
-
-    # --------------------------------------------------
-    # 4. Segment the region into candidate records.
-    # --------------------------------------------------
-
-        segmentation_result = segment_roster_records(
-            selected_words,
-            selection_bbox,
-            layout_result,
-        )
-
-        self.selected_region_data["segmentation"] = (
-            segmentation_result
-        )
-
-        player_entries = segmentation_result.get(
-            "records",
-            [],
-        )
-
-        self.selected_region_data["player_entries"] = (
-            player_entries
-        )
-
-        # --------------------------------------------------
-# SEMANTIC ANALYSIS OF CANDIDATE RECORDS
-# --------------------------------------------------
-
-        # --------------------------------------------------
-# RECONSTRUCT SPATIAL PDF CELLS
-# --------------------------------------------------
-
-        cell_reconstruction = reconstruct_pdf_roster_cells(
-            player_entries,
-            layout_result,
-        )
-
-        self.selected_region_data["cell_reconstruction"] = (
-            cell_reconstruction
-)
-
-        semantic_input_records = cell_reconstruction.get(
-            "records",
-            player_entries,
-        )
-
-
-# --------------------------------------------------
-# ANALYZE RECONSTRUCTED CELL VALUES
-# --------------------------------------------------
-
-        semantic_result = analyze_pdf_roster_values(
-            semantic_input_records
-        )
-
-        self.selected_region_data["semantic_analysis"] = (
-            semantic_result
-        )
-
-# --------------------------------------------------
-# RESOLVE CANDIDATE ROSTER FIELDS
-# --------------------------------------------------
-
-        field_resolution = resolve_pdf_roster_fields(
-            semantic_result
-            )
-
-        self.selected_region_data["field_resolution"] = (
-            field_resolution
-                )
-
-# --------------------------------------------------
-# RESOLVE CANDIDATE ROSTER FIELDS
-# --------------------------------------------------
-
-        field_resolution = resolve_pdf_roster_fields(
-            semantic_result
-        )
-
-        self.selected_region_data["field_resolution"] = (
-            field_resolution
-            )
-
-    # --------------------------------------------------
-    # 5. Populate the candidate player-entry table.
-    # --------------------------------------------------
-
-        # --------------------------------------------------
-# DISPLAY RECONSTRUCTED PLAYER RECORDS
-# --------------------------------------------------
-
-        reconstructed_records = cell_reconstruction.get(
-            "records",
-                [],
-                )
 
         self.roster_table.clear()
-        self.roster_table.setRowCount(len(player_entries))
-        self.roster_table.setColumnCount(5)
+        self.roster_table.setColumnCount(len(headers))
+        self.roster_table.setHorizontalHeaderLabels(headers)
+        self.roster_table.setRowCount(len(records))
 
-        self.roster_table.setHorizontalHeaderLabels([
-        "Jersey Candidate",
-    "Name Candidate",
-    "Reconstructed Cells",
-    "Original Entry Text",
-    "Word Count",
-])
-
-        for row_index, record in enumerate(player_entries):
-
-            reconstructed_record = (
-                reconstructed_records[row_index]
-                if row_index < len(reconstructed_records)
-                else {}
-            )
-
-            cells = reconstructed_record.get("cells", [])
-
-            cell_summary = "\n".join(
-        (
-            f"Column {cell['column_index'] + 1}: "
-            f"{cell['text'].replace(chr(10), ' / ')}"
-        )
-            for cell in cells
-                if cell.get("text")
-            )
-
+        for row_index, record in enumerate(records):
             values = [
-                record.get("jersey_candidate", ""),
-                record.get("name_candidate", ""),
-                cell_summary,
-                record.get("entry_text", ""),
-                str(record.get("word_count", 0)),
+                str(record.get("page_number", "")),
+                str(record.get("row_index", "")),
+                record.get("confidence", "unknown"),
             ]
+
+            cells = record.get("cells", [])
+
+            values.extend(
+                cell.get("text", "")
+                for cell in cells
+            )
+
+            while len(values) < len(headers):
+                values.append("")
 
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
 
                 item.setToolTip(
-                    f"Record ID: {record.get('record_id', '')}\n"
-                    f"Column: {record.get('column_index', '')}\n"
-                    f"Record boundaries: {record.get('bbox', [])}"
+                    f"Record: {record.get('record_id', '')}\n"
+                    f"Bounding box: {record.get('bbox', [])}\n"
+                    f"Source word count: {record.get('word_count', 0)}"
                 )
 
                 self.roster_table.setItem(
@@ -3445,119 +3167,95 @@ class PDFVisualInspector(QDialog):
 
         self.roster_table.resizeRowsToContents()
         self.roster_table.resizeColumnsToContents()
-    # --------------------------------------------------
-    # 6. Preserve unresolved content.
-    # --------------------------------------------------
 
-        unassigned_words = segmentation_result.get(
-            "unassigned_words",
-            [],
+        self.column_info_label.setText(
+            f"Page {page_number} | "
+            f"{diagnostics.get('word_count', 0)} words | "
+            f"{diagnostics.get('row_count', 0)} visual rows | "
+            f"{diagnostics.get('record_count', 0)} candidate rows | "
+            f"{diagnostics.get('column_count', 0)} inferred columns\n"
+            f"{diagnostics.get('reason', '')}"
         )
 
-        unassigned_lines = {}
+        review_lines = []
 
-        for word in unassigned_words:
-            line_key = (
-                word.get("block_number"),
-                word.get("line_number"),
+        if page_data.get("unassigned_text", "").strip():
+            review_lines.append(
+                "HEADER / UNASSIGNED ROWS:\n"
+                + page_data["unassigned_text"]
             )
 
-            unassigned_lines.setdefault(
-                line_key,
-                [],
-            ).append(word)
+        low_confidence = [
+            record for record in records
+            if record.get("review_required")
+        ]
 
-        unresolved_text = []
+        if low_confidence:
+            review_lines.append("LOW-CONFIDENCE CANDIDATE ROWS:")
 
-        for line_words in unassigned_lines.values():
-            line_words.sort(
-                key=lambda item: item.get("word_number", 0)
+            review_lines.extend(
+                f"Row {record.get('row_index')}: {record.get('text')}"
+                for record in low_confidence
             )
 
-            unresolved_text.append(
-             " ".join(
-                    item.get("text", "")
-                    for item in line_words
+        page_recoveries = [
+            item for item in self.recovery_results
+            if item.get("page_number") == page_number
+            and item.get("file_path") == self.current_path
+        ]
+
+        if page_recoveries:
+            review_lines.append(
+                "SUPPLEMENTAL REGION RECOVERY RESULTS:"
+            )
+
+            for recovery in page_recoveries:
+                review_lines.extend(
+                    record.get("text", "")
+                    for record in recovery.get("records", [])
                 )
-            )
 
         self.unassigned_output.setPlainText(
-            "\n".join(unresolved_text)
+            "\n\n".join(review_lines)
         )
 
-    # --------------------------------------------------
-    # 7. Update layout and segmentation diagnostics.
-    # --------------------------------------------------
+    def handle_region_selected(self, rectangle):
+        if not self.current_page_words or not self.current_path:
+            return
 
-        layout_type = layout_result.get(
-            "layout_type",
-            "unclassified",
+        from roster_pdf_reconstruction import recover_selected_region
+
+        selection_bbox = [
+            rectangle.left(),
+            rectangle.top(),
+            rectangle.right(),
+            rectangle.bottom(),
+        ]
+
+        recovery = recover_selected_region(
+            self.current_page_words,
+            selection_bbox,
+            self.current_page_number,
         )
 
-        layout_confidence = layout_result.get(
-            "confidence",
-            0,
+        recovery["file_path"] = self.current_path
+
+        self.recovery_results.append(recovery)
+
+        self.display_page_results(self.current_page_number)
+
+        self.document_status_label.setText(
+            "Selected region analyzed as supplemental recovery. "
+            "The automatic full-page results remain intact."
         )
-
-        segmentation_diagnostics = segmentation_result.get(
-            "diagnostics",
-            "No segmentation diagnostics available.",
-        )
-
-        cell_diagnostics = cell_reconstruction.get(
-    "diagnostics",
-    {},
-)
-
-        layout_summary = (
-            f"Layout: {layout_type.replace('_', ' ').title()} "
-            f"({layout_confidence:.0%} confidence)\n"
-    f"Candidate records: {len(player_entries)}\n"
-    f"Inferred columns: "
-    f"{cell_diagnostics.get('column_count', 0)}\n"
-    f"{cell_diagnostics.get('reason', '')}\n"
-    f"{segmentation_diagnostics}"
-)
-        self.column_info_label.setText(
-            layout_summary
-        )
-
-        self.column_info_label.setToolTip(
-            "\n".join(
-                layout_result.get("evidence", [])
-            )
-        )
-
-    # --------------------------------------------------
-    # 8. Update selected-region information.
-    # --------------------------------------------------
-
-        self.region_info_label.setText(
-            f"Page {self.current_page_number} | "
-            f"{len(selected_words)} words extracted | "
-            f"{len(reconstructed_lines)} source lines | "
-            f"{len(player_entries)} candidate records | "
-            f"Selected region: "
-            f"X={sx0:.1f}, Y={sy0:.1f}, "
-            f"Width={sx1 - sx0:.1f}, "
-            f"Height={sy1 - sy0:.1f}"
-        )
-
-    # ======================================================
-    # AUTOMATIC STRUCTURE OVERLAYS
-    # ======================================================
 
     def draw_overlays(self, page_data):
-        """Draw detected structures over the rendered PDF page."""
+        """Draw universal structural analyzer overlays."""
 
         for category, style in self.OVERLAY_STYLES.items():
-
             color_hex, _label = style
 
-            items = page_data.get(category, [])
-
-            for item in items:
-
+            for item in page_data.get(category, []):
                 bbox = item.get("bbox")
 
                 if not bbox or len(bbox) != 4:
@@ -3565,7 +3263,6 @@ class PDFVisualInspector(QDialog):
 
                 try:
                     x0, y0, x1, y1 = map(float, bbox)
-
                 except (TypeError, ValueError):
                     continue
 
@@ -3573,13 +3270,10 @@ class PDFVisualInspector(QDialog):
                     continue
 
                 color = QColor(color_hex)
-
                 pen = QPen(color, 1.5)
 
                 if category == "unassigned_text":
-                    pen.setStyle(
-                        Qt.PenStyle.DashLine
-                    )
+                    pen.setStyle(Qt.PenStyle.DashLine)
 
                 brush = QBrush(
                     QColor(
