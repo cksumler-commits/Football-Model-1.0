@@ -3132,13 +3132,11 @@ class PDFVisualInspector(QDialog):
         page_data = pages[page_number - 1]
         records = page_data.get("records", [])
         diagnostics = page_data.get("diagnostics", {})
+        normalization = page_data.get("normalization", {})
 
-        maximum_columns = max(
-            (
-                len(record.get("cells", []))
-                for record in records
-            ),
-            default=0,
+        maximum_columns = normalization.get(
+            "column_count",
+            0,
         )
 
         headers = [
@@ -3148,7 +3146,7 @@ class PDFVisualInspector(QDialog):
         ]
 
         headers.extend(
-            f"Reconstructed Column {index + 1}"
+            f"Field {index + 1}"
             for index in range(maximum_columns)
         )
 
@@ -3156,6 +3154,10 @@ class PDFVisualInspector(QDialog):
         self.roster_table.setColumnCount(len(headers))
         self.roster_table.setHorizontalHeaderLabels(headers)
         self.roster_table.setRowCount(len(records))
+
+        # --------------------------------------------------
+        # DISPLAY NORMALIZED RECORDS
+        # --------------------------------------------------
 
         for row_index, record in enumerate(records):
             source_rows = ", ".join(
@@ -3172,11 +3174,11 @@ class PDFVisualInspector(QDialog):
                 ),
             ]
 
-            cells = record.get("cells", [])
+            fields = record.get("normalized_fields", [])
 
             values.extend(
-                cell.get("text", "")
-                for cell in cells
+                field.get("text", "")
+                for field in fields
             )
 
             while len(values) < len(headers):
@@ -3186,24 +3188,32 @@ class PDFVisualInspector(QDialog):
                 item = QTableWidgetItem(str(value))
 
                 if column_index >= 3:
-                    cell_index = column_index - 3
+                    field_index = column_index - 3
 
-                    if cell_index < len(cells):
-                        cell = cells[cell_index]
+                    if field_index < len(fields):
+                        normalized_field = fields[field_index]
 
                         fragment_details = "\n".join(
                             (
-                                f"Visual row {fragment['row_index'] + 1}: "
+                                f"Visual row "
+                                f"{fragment['visual_row_index'] + 1}: "
                                 f"{fragment['text']}"
                             )
-                            for fragment in cell.get("fragments", [])
+                            for fragment in normalized_field.get(
+                                "fragments",
+                                [],
+                            )
                         )
 
                         item.setToolTip(
-                            f"Combined value: {cell.get('text', '')}\n"
-                            f"Original fragments:\n{fragment_details}\n"
-                            f"Bounding box: {cell.get('bbox', [])}\n"
-                            f"Source words: {cell.get('word_count', 0)}"
+                            f"Normalized value:\n"
+                            f"{normalized_field.get('text', '')}\n\n"
+                            f"Original fragments:\n"
+                            f"{fragment_details}\n\n"
+                            f"Bounding box: "
+                            f"{normalized_field.get('bbox', [])}\n"
+                            f"Source words: "
+                            f"{normalized_field.get('word_count', 0)}"
                         )
 
                 else:
@@ -3224,15 +3234,32 @@ class PDFVisualInspector(QDialog):
         self.roster_table.resizeRowsToContents()
         self.roster_table.resizeColumnsToContents()
 
+        # --------------------------------------------------
+        # NORMALIZATION DIAGNOSTICS
+        # --------------------------------------------------
+
+        normalization_diagnostics = normalization.get(
+            "diagnostics",
+            {},
+        )
+
         self.column_info_label.setText(
             f"Page {page_number} | "
             f"{diagnostics.get('word_count', 0)} words | "
             f"{diagnostics.get('row_count', 0)} visual rows | "
             f"{diagnostics.get('record_count', 0)} grouped candidates | "
-            f"{diagnostics.get('column_count', 0)} inferred columns | "
+            f"{maximum_columns} normalized columns | "
             f"{diagnostics.get('anchor_count', 0)} record anchors\n"
+            f"Normalization strategy: "
+            f"{normalization.get('strategy', 'unavailable')} | "
+            f"Rows processed: "
+            f"{normalization_diagnostics.get('visual_rows_processed', 0)}\n"
             f"{diagnostics.get('reason', '')}"
         )
+
+        # --------------------------------------------------
+        # PRESERVE UNASSIGNED AND REVIEW CONTENT
+        # --------------------------------------------------
 
         review_lines = []
 
@@ -3271,6 +3298,10 @@ class PDFVisualInspector(QDialog):
                 )
                 for record in low_confidence
             )
+
+        # --------------------------------------------------
+        # SUPPLEMENTAL REGION RECOVERY
+        # --------------------------------------------------
 
         page_recoveries = [
             item for item in self.recovery_results

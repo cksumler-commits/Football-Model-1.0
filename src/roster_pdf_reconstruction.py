@@ -473,6 +473,188 @@ def _merge_record_rows(page_number, row_group, anchor_row_index):
     }
 
 
+def _normalize_reconstructed_records(records, median_height):
+    """
+    Organize already-reconstructed candidate records into
+    shared, unlabeled columns.
+
+    This function does not identify football fields, remove
+    information, or change the original reconstructed cells.
+
+    It uses the source-word coordinates to find recurring
+    horizontal column positions across reconstructed records.
+    """
+
+    record_rows = {}
+    all_rows = []
+
+    row_tolerance = max(2.0, median_height * 0.65)
+
+    # --------------------------------------------------
+    # REBUILD VISUAL ROWS FROM RECONSTRUCTED RECORDS
+    # --------------------------------------------------
+
+    for record in records:
+        record_id = record.get("record_id")
+
+        source_words = record.get("source_words", [])
+
+        geometries = [
+            geometry
+            for geometry in (
+                _word_geometry(word)
+                for word in source_words
+            )
+            if geometry is not None
+        ]
+
+        rows = _group_visual_rows(
+            geometries,
+            row_tolerance,
+        )
+
+        record_rows[record_id] = rows
+        all_rows.extend(rows)
+
+    # --------------------------------------------------
+    # DETECT SHARED GENERIC COLUMN POSITIONS
+    # --------------------------------------------------
+
+    if all_rows:
+        boundaries, gap_threshold, position_tolerance = (
+            _detect_columns(
+                all_rows,
+                median_height,
+            )
+        )
+    else:
+        boundaries = []
+        gap_threshold = 0.0
+        position_tolerance = 0.0
+
+    column_count = len(boundaries) + 1
+
+    columns = []
+
+    for column_index in range(column_count):
+        x_start = (
+            boundaries[column_index - 1]["x"]
+            if column_index > 0
+            else None
+        )
+
+        columns.append({
+            "column_index": column_index,
+            "label": f"Field {column_index + 1}",
+            "x_start": x_start,
+        })
+
+    # --------------------------------------------------
+    # ORGANIZE EACH RECORD INTO THE SHARED COLUMNS
+    # --------------------------------------------------
+
+    normalized_records = {}
+
+    for record in records:
+        record_id = record.get("record_id")
+        rows = record_rows.get(record_id, [])
+
+        field_fragments = [
+            [] for _ in range(column_count)
+        ]
+
+        for visual_row_index, row in enumerate(rows):
+            row_cells = _split_row_into_cells(
+                row,
+                boundaries,
+                position_tolerance,
+            )
+
+            for cell in row_cells:
+                column_index = cell["column_index"]
+
+                if column_index >= column_count:
+                    continue
+
+                if not cell["text"]:
+                    continue
+
+                field_fragments[column_index].append({
+                    "visual_row_index": visual_row_index,
+                    "text": cell["text"],
+                    "bbox": cell.get("bbox"),
+                    "source_words": cell.get("words", []),
+                })
+
+        normalized_fields = []
+
+        for column_index, fragments in enumerate(field_fragments):
+            source_words = [
+                word
+                for fragment in fragments
+                for word in fragment["source_words"]
+            ]
+
+            boxes = [
+                fragment["bbox"]
+                for fragment in fragments
+                if fragment.get("bbox")
+            ]
+
+            field_bbox = None
+
+            if boxes:
+                field_bbox = [
+                    min(box[0] for box in boxes),
+                    min(box[1] for box in boxes),
+                    max(box[2] for box in boxes),
+                    max(box[3] for box in boxes),
+                ]
+
+            normalized_fields.append({
+                "field_index": column_index,
+                "label": f"Field {column_index + 1}",
+
+                "text": "\n".join(
+                    fragment["text"]
+                    for fragment in fragments
+                ),
+
+                "fragments": fragments,
+                "source_words": source_words,
+                "bbox": field_bbox,
+                "word_count": len(source_words),
+
+                "contributing_visual_rows": [
+                    fragment["visual_row_index"]
+                    for fragment in fragments
+                ],
+            })
+
+        normalized_records[record_id] = normalized_fields
+
+    return {
+        "strategy": "shared_horizontal_alignment",
+        "column_count": column_count,
+        "columns": columns,
+        "records": normalized_records,
+        "diagnostics": {
+            "records_processed": len(records),
+            "visual_rows_processed": len(all_rows),
+            "column_boundaries": boundaries,
+            "gap_threshold": round(gap_threshold, 2),
+            "position_tolerance": round(
+                position_tolerance,
+                2,
+            ),
+        },
+    }
+
+
+
+
+
+
 def _reconstruct_page(page_number, source_words):
     geometries = [
         item for item in
@@ -488,6 +670,17 @@ def _reconstruct_page(page_number, source_words):
             "rows": [],
             "records": [],
             "columns": [],
+            "normalization": {
+                "strategy": "shared_horizontal_alignment",
+                "column_count": 0,
+                "columns": [],
+                "records": {},
+                "diagnostics": {
+                    "records_processed": 0,
+                    "visual_rows_processed": 0,
+                    "reason": "No usable word geometry was extracted.",
+                },
+            },
             "unassigned_text": "",
             "unassigned_content": [],
             "diagnostics": {
@@ -569,7 +762,7 @@ def _reconstruct_page(page_number, source_words):
             eligible_rows.append(row_result)
 
     # --------------------------------------------------
-    # Find strong record-start rows using combined evidence.
+    # FIND RECORD-START ROWS
     # --------------------------------------------------
 
     anchors = [
@@ -577,8 +770,6 @@ def _reconstruct_page(page_number, source_words):
         if row["features"]["is_anchor"]
     ]
 
-    # Conservative fallback for unusual layouts where the usual
-    # position/height/weight/class combination is absent.
     if not anchors:
         anchors = [
             row for row in eligible_rows
@@ -628,11 +819,6 @@ def _reconstruct_page(page_number, source_words):
             if group:
                 record_groups.append((anchor, group))
 
-    else:
-        # Do not pretend that arbitrary visual rows are players.
-        # Keep the content visible for review instead.
-        record_groups = []
-
     records = []
 
     for anchor, group in record_groups:
@@ -648,8 +834,6 @@ def _reconstruct_page(page_number, source_words):
         record["record_features"] = features
         record["confidence_score"] = min(1.0, score / 9.0)
 
-        # Confidence remains deliberately cautious until semantic
-        # column mapping validates the values.
         if score >= 7:
             record["confidence"] = "medium"
         else:
@@ -657,6 +841,29 @@ def _reconstruct_page(page_number, source_words):
 
         record["review_required"] = True
         records.append(record)
+
+    # --------------------------------------------------
+    # GENERIC COLUMN NORMALIZATION
+    # Operates AFTER candidate records are reconstructed.
+    # Does not alter or delete original reconstructed data.
+    # --------------------------------------------------
+
+    normalization = _normalize_reconstructed_records(
+        records,
+        median_height,
+    )
+
+    for record in records:
+        record["normalized_fields"] = (
+            normalization["records"].get(
+                record["record_id"],
+                [],
+            )
+        )
+
+    # --------------------------------------------------
+    # IDENTIFY UNASSIGNED CONTENT
+    # --------------------------------------------------
 
     assigned_row_indices = {
         row_index
@@ -697,10 +904,10 @@ def _reconstruct_page(page_number, source_words):
         "page_number": page_number,
         "source_words": source_words,
         "visual_rows": visual_rows,
-        # Keep the previous key for compatibility with existing callers.
         "rows": visual_rows,
         "records": records,
         "columns": column_starts,
+        "normalization": normalization,
         "unassigned_text": "\n".join(
             item["text"] for item in unassigned_content
         ),
@@ -717,8 +924,8 @@ def _reconstruct_page(page_number, source_words):
             "column_boundaries": column_starts,
             "reason": (
                 "Visual rows were grouped around multi-signal "
-                "record anchors. Cell fragments and source words "
-                "were retained."
+                "record anchors. Generic column normalization "
+                "was applied to reconstructed candidates."
                 if records
                 else
                 "No sufficiently supported player-record anchors "

@@ -179,54 +179,111 @@ def split_name(name):
     )
 
 
+
 def normalize_position(position):
 
     position = clean_text(position).upper()
 
     aliases = {
-        "QB": "QB",
         "QUARTERBACK": "QB",
+        "QB": "QB",
+
+        "RUNNING BACK": "RB",
+        "HALFBACK": "RB",
+        "TAILBACK": "RB",
         "RB": "RB",
         "HB": "RB",
         "TB": "RB",
-        "RUNNING BACK": "RB",
-        "FB": "FB",
+
         "FULLBACK": "FB",
-        "WR": "WR",
+        "FB": "FB",
+
         "WIDE RECEIVER": "WR",
-        "TE": "TE",
+        "WR": "WR",
+
         "TIGHT END": "TE",
-        "OL": "OL",
+        "TE": "TE",
+
         "OFFENSIVE LINE": "OL",
+        "OL": "OL",
+        "OFFENSIVE TACKLE": "OT",
         "OT": "OT",
+        "OFFENSIVE GUARD": "OG",
         "OG": "OG",
+        "CENTER": "C",
+        "OC": "C",
         "C": "C",
-        "DL": "DL",
+
         "DEFENSIVE LINE": "DL",
+        "DL": "DL",
+        "DEFENSIVE END": "DE",
         "DE": "DE",
+        "DEFENSIVE TACKLE": "DT",
         "DT": "DT",
+        "NOSE TACKLE": "NT",
         "NT": "NT",
-        "LB": "LB",
+        "NOSE GUARD": "NG",
+        "NG": "NG",
+
         "LINEBACKER": "LB",
+        "LB": "LB",
+        "INSIDE LINEBACKER": "ILB",
         "ILB": "ILB",
+        "MIDDLE LINEBACKER": "MLB",
+        "MLB": "MLB",
+        "OUTSIDE LINEBACKER": "OLB",
         "OLB": "OLB",
-        "CB": "CB",
+
+        "EDGE": "EDGE",
+        "EDGE RUSHER": "EDGE",
+
         "CORNERBACK": "CB",
-        "S": "S",
-        "SAFETY": "S",
-        "FS": "FS",
-        "SS": "SS",
-        "DB": "DB",
+        "CB": "CB",
+
         "DEFENSIVE BACK": "DB",
+        "DB": "DB",
+
+        "SAFETY": "S",
+        "S": "S",
+        "FREE SAFETY": "FS",
+        "FS": "FS",
+        "STRONG SAFETY": "SS",
+        "SS": "SS",
+
+        "NICKEL": "NB",
+        "NICKELBACK": "NB",
+        "NB": "NB",
+
+        "KICKER": "K",
         "K": "K",
-        "PK": "K",
+
+        "PLACE KICKER": "PK",
+        "PK": "PK",
+
+        "PUNTER": "P",
         "P": "P",
+
+        "LONG SNAPPER": "LS",
         "LS": "LS",
-        "ATH": "ATH",
+
         "ATHLETE": "ATH",
+        "ATH": "ATH",
+
+        "RETURNER": "RET",
+        "RET": "RET",
+        "KICK RETURNER": "KR",
+        "KR": "KR",
+        "PUNT RETURNER": "PR",
+        "PR": "PR",
+
+        "ROVER": "ROVER",
+        "BANDIT": "BANDIT",
+        "JACK": "JACK",
     }
 
+    # Keep unfamiliar position labels rather than discarding them.
     return aliases.get(position, position)
+    
 
 
 def infer_school(soup, url):
@@ -894,15 +951,15 @@ class StructuredDataExtractor:
 
     
 
+
 class PatternExtractor:
 
     """
-    Fallback extractor for roster pages that do not use
+    General fallback extractor for roster pages that do not use
     recognizable HTML tables or standard player-card classes.
 
-    It identifies player-name links, searches their surrounding
-    HTML for repeated player information, and extracts whatever
-    fields can be recognized with reasonable confidence.
+    Uses player-name links, surrounding record structure, explicit
+    field labels, HTML attributes, and text patterns.
     """
 
     NAME_BLACKLIST = {
@@ -922,11 +979,14 @@ class PatternExtractor:
     CLASS_PATTERNS = [
         r"\bredshirt\s+(?:freshman|sophomore|junior|senior)\b",
         r"\b(?:freshman|sophomore|junior|senior)\b",
-        r"\b(?:fifth|sixth|seventh)\s+year\b",
+        r"\b(?:fifth|sixth|seventh|eighth)\s+year\b",
         r"\bgraduate\s+student\b",
-        r"\b(?:1st|2nd|3rd|4th|5th|6th)\b",
+        r"\b(?:1st|2nd|3rd|4th|5th|6th|7th|8th)\s+year\b",
     ]
 
+    # Longer position names and abbreviations come first.
+    # Single-letter positions are handled separately to reduce
+    # accidental matches in ordinary roster text.
     POSITION_PATTERNS = [
         ("OFFENSIVE LINE", "OL"),
         ("DEFENSIVE LINE", "DL"),
@@ -936,39 +996,68 @@ class PatternExtractor:
         ("QUARTERBACK", "QB"),
         ("LINEBACKER", "LB"),
         ("CORNERBACK", "CB"),
-        ("SAFETY", "S"),
-        ("FULLBACK", "FB"),
-        ("KICKER", "K"),
-        ("PUNTER", "P"),
+        ("DEFENSIVE BACK", "DB"),
+        ("OFFENSIVE TACKLE", "OT"),
+        ("OFFENSIVE GUARD", "OG"),
+        ("DEFENSIVE END", "DE"),
+        ("DEFENSIVE TACKLE", "DT"),
         ("LONG SNAPPER", "LS"),
+        ("PLACE KICKER", "PK"),
+        ("PUNTER", "P"),
+        ("KICKER", "K"),
+        ("FULLBACK", "FB"),
+        ("SAFETY", "S"),
+        ("EDGE", "EDGE"),
+        ("NICKEL", "NB"),
+        ("ROVER", "ROVER"),
+        ("BANDIT", "BANDIT"),
+        ("JACK", "JACK"),
+        ("ATHLETE", "ATH"),
         ("QB", "QB"),
         ("RB", "RB"),
         ("HB", "RB"),
+        ("TB", "RB"),
         ("FB", "FB"),
         ("WR", "WR"),
         ("TE", "TE"),
         ("OL", "OL"),
         ("OT", "OT"),
         ("OG", "OG"),
-        ("C", "C"),
+        ("OC", "C"),
         ("DL", "DL"),
         ("DE", "DE"),
         ("DT", "DT"),
         ("NT", "NT"),
+        ("NG", "NG"),
         ("LB", "LB"),
         ("ILB", "ILB"),
+        ("MLB", "MLB"),
         ("OLB", "OLB"),
+        ("EDGE", "EDGE"),
         ("CB", "CB"),
         ("DB", "DB"),
         ("FS", "FS"),
         ("SS", "SS"),
-        ("S", "S"),
-        ("K", "K"),
-        ("PK", "K"),
-        ("P", "P"),
+        ("NB", "NB"),
         ("LS", "LS"),
+        ("PK", "PK"),
         ("ATH", "ATH"),
+        ("PR", "PR"),
+        ("KR", "KR"),
+        ("SAF", "S"),
     ]
+
+    POSITION_LABEL_PATTERN = re.compile(
+        r"\b(?:position|pos)\s*[:\-]\s*"
+        r"([A-Za-z][A-Za-z /&-]{0,30})",
+        re.IGNORECASE
+    )
+
+    JERSEY_LABEL_PATTERN = re.compile(
+        r"\b(?:jersey|uniform|player)\s*"
+        r"(?:number|no\.?|#)\s*[:#\-]?\s*(\d{1,2})\b",
+        re.IGNORECASE
+    )
 
     @staticmethod
     def is_likely_name(value):
@@ -992,7 +1081,6 @@ class PatternExtractor:
         if len(words) < 2 or len(words) > 5:
             return False
 
-        # Names should primarily contain alphabetic characters.
         for word in words:
             if not re.fullmatch(
                 r"[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ.'’\-]*",
@@ -1012,17 +1100,19 @@ class PatternExtractor:
         if not cls.is_likely_name(name):
             return False
 
-        href = str(anchor.get("href", "")).lower()
+        href = str(
+            anchor.get("href", "")
+        ).lower()
 
         classes = " ".join(
             anchor.get("class", [])
         ).lower()
 
         parent = anchor.parent
-
         inside_heading = False
 
         while parent is not None and getattr(parent, "name", None):
+
             if parent.name in ("h2", "h3", "h4"):
                 inside_heading = True
                 break
@@ -1076,11 +1166,16 @@ class PatternExtractor:
 
         position = PatternExtractor.find_position(text)
 
+        jersey = PatternExtractor.JERSEY_LABEL_PATTERN.search(
+            text
+        )
+
         return bool(
             height
             or weight
             or class_year
             or position
+            or jersey
         )
 
     @classmethod
@@ -1124,8 +1219,6 @@ class PatternExtractor:
                 if cls.is_name_anchor(link)
             ]
 
-            # A player record should normally contain one
-            # recognizable player-name link.
             if len(name_links) == 1:
                 return parent
 
@@ -1174,12 +1267,39 @@ class PatternExtractor:
 
         return ""
 
-    @staticmethod
-    def find_position(text):
+    @classmethod
+    def find_position(cls, text):
 
-        text_upper = clean_text(text).upper()
+        text = clean_text(text)
 
-        for label, position in PatternExtractor.POSITION_PATTERNS:
+        if not text:
+            return ""
+
+        # First look for an explicitly labeled position.
+        labeled_match = cls.POSITION_LABEL_PATTERN.search(text)
+
+        if labeled_match:
+
+            labeled_value = clean_text(
+                labeled_match.group(1)
+            ).upper()
+
+            labeled_value = re.split(
+                r"[,;|]",
+                labeled_value
+            )[0].strip()
+
+            if labeled_value:
+                return labeled_value
+
+        text_upper = text.upper()
+
+        # Match multi-character position labels using word
+        # boundaries so that "DE" does not match inside a word.
+        for label, position in cls.POSITION_PATTERNS:
+
+            if len(label) < 2:
+                continue
 
             pattern = (
                 r"(?<![A-Z])"
@@ -1190,11 +1310,138 @@ class PatternExtractor:
             if re.search(pattern, text_upper):
                 return position
 
+        # Single-letter positions are only accepted when the
+        # entire value is a single position or a clearly labeled
+        # position. This avoids matching random letters in text.
+        single_letter_positions = {
+            "C": "C",
+            "S": "S",
+            "K": "K",
+            "P": "P",
+        }
+
+        if text_upper in single_letter_positions:
+            return single_letter_positions[text_upper]
+
         return ""
 
     @staticmethod
-    def find_jersey_number(record, name):
+    def extract_number_from_value(value):
 
+        value = clean_text(value)
+
+        if not value:
+            return ""
+
+        patterns = [
+            r"^\s*#\s*(\d{1,2})\s*$",
+            r"^\s*(\d{1,2})\s*$",
+            r"\b(?:jersey|uniform|player)\s*"
+            r"(?:number|no\.?|#)\s*[:#\-]?\s*(\d{1,2})\b",
+        ]
+
+        for pattern in patterns:
+
+            match = re.search(
+                pattern,
+                value,
+                re.IGNORECASE
+            )
+
+            if match:
+                return match.group(1)
+
+        return ""
+
+    @classmethod
+    def find_jersey_number(cls, record, name):
+
+        # 1. Search the complete record text for an explicit label.
+        record_text = clean_text(
+            record.get_text(" ", strip=True)
+        )
+
+        labeled_match = cls.JERSEY_LABEL_PATTERN.search(
+            record_text
+        )
+
+        if labeled_match:
+            return labeled_match.group(1)
+
+        # 2. Inspect HTML elements and their attributes.
+        # This catches accessible labels and data attributes.
+        for element in record.find_all(True):
+
+            attributes = []
+
+            for key, value in element.attrs.items():
+
+                if isinstance(value, list):
+                    value = " ".join(
+                        str(item) for item in value
+                    )
+
+                attributes.append(
+                    f"{key} {value}"
+                )
+
+            attribute_text = " ".join(attributes)
+
+            if not re.search(
+                r"jersey|uniform|player.?number|"
+                r"roster.?number|(^|[\s_-])number([\s_-]|$)",
+                attribute_text,
+                re.IGNORECASE
+            ):
+                continue
+
+            # Check the attributes themselves first.
+            number = cls.extract_number_from_value(
+                attribute_text
+            )
+
+            if number:
+                return number
+
+            # Then check the element's visible text.
+            number = cls.extract_number_from_value(
+                element.get_text(" ", strip=True)
+            )
+
+            if number:
+                return number
+
+        # 3. Check common explicit labels in definition lists.
+        for label in record.find_all(
+            ["dt", "th", "label", "span", "div"]
+        ):
+
+            label_text = clean_text(
+                label.get_text(" ", strip=True)
+            )
+
+            if not re.fullmatch(
+                r"(?:jersey|uniform|player)?\s*"
+                r"(?:number|no\.?|#)",
+                label_text,
+                re.IGNORECASE
+            ):
+                continue
+
+            value_element = (
+                label.find_next_sibling()
+                or label.find_next()
+            )
+
+            if value_element:
+                number = cls.extract_number_from_value(
+                    value_element.get_text(" ", strip=True)
+                )
+
+                if number:
+                    return number
+
+        # 4. Preserve the original nearby-number fallback.
         strings = [
             clean_text(value)
             for value in record.find_all(string=True)
@@ -1208,22 +1455,19 @@ class PatternExtractor:
                 name_index = index
                 break
 
-        if name_index is None:
-            return ""
+        if name_index is not None:
 
-        # Look backward from the player name for a standalone
-        # jersey number.
-        for value in reversed(
-            strings[max(0, name_index - 4):name_index]
-        ):
+            for value in reversed(
+                strings[max(0, name_index - 4):name_index]
+            ):
 
-            match = re.fullmatch(
-                r"#?\s*(\d{1,2})",
-                value
-            )
+                match = re.fullmatch(
+                    r"#?\s*(\d{1,2})",
+                    value
+                )
 
-            if match:
-                return match.group(1)
+                if match:
+                    return match.group(1)
 
         return ""
 
@@ -1232,10 +1476,11 @@ class PatternExtractor:
 
         player = empty_player()
 
-        # Reuse the existing card-field reader where possible.
+        # Reuse the existing card-field reader.
         for field, keywords in CardExtractor.FIELD_KEYWORDS.items():
 
             try:
+
                 value = CardExtractor.find_field(
                     record,
                     keywords
@@ -1267,6 +1512,45 @@ class PatternExtractor:
                     player[field] = clean_text(
                         dd.get_text(" ", strip=True)
                     )
+
+        # Read explicitly labeled fields using common HTML
+        # attributes such as data-label, aria-label and title.
+        for element in record.find_all(True):
+
+            label_parts = []
+
+            for attribute in (
+                "data-label",
+                "aria-label",
+                "title",
+                "data-field",
+                "data-stat",
+            ):
+
+                value = element.get(attribute)
+
+                if value:
+                    label_parts.append(
+                        clean_text(value)
+                    )
+
+            label = " ".join(label_parts)
+
+            if not label:
+                continue
+
+            normalized = normalize_header(label)
+
+            for field, aliases in HEADER_ALIASES.items():
+
+                if normalized in aliases:
+
+                    value = clean_text(
+                        element.get_text(" ", strip=True)
+                    )
+
+                    if value:
+                        player[field] = value
 
         return player
 
@@ -1306,8 +1590,8 @@ class PatternExtractor:
             anchor.get("href", "")
         )
 
-        # Preserve the complete original text so information
-        # that cannot yet be mapped is not discarded.
+        # Preserve original information even when a field
+        # cannot confidently be identified.
         player["raw_fields"] = {
             "Roster Details": text,
             "Profile URL": profile_url,
@@ -1375,7 +1659,6 @@ class PatternExtractor:
             players.append(player)
 
         return TableExtractor.remove_duplicates(players)
-
 
 
 
